@@ -154,16 +154,14 @@ def test_context():
 def test_config():
     """测试 Config（需要有效的模型路径）"""
     print("=" * 50)
-    print("测试 Config (跳过，需要模型路径)")
+    print("测试 Config")
     print("=" * 50)
     
-    # 如果你有模型，可以取消注释下面的代码
-    # config = Config(model="/path/to/your/Qwen3-0.6B")
-    # print(f"模型配置: {config.hf_config}")
-    # print(f"max_model_len: {config.max_model_len}")
-    # print(f"kvcache_block_size: {config.kvcache_block_size}")
+    config = Config(model="models/Qwen3-0.6B")
+    print(f"模型配置: {config.hf_config}")
+    print(f"max_model_len: {config.max_model_len}")
+    print(f"kvcache_block_size: {config.kvcache_block_size}")
     
-    print("⏭️ Config 测试跳过（需要有效模型路径）\n")
 
 
 if __name__ == "__main__":
