@@ -69,27 +69,27 @@ nanovllm/
 
 #### 下午 (PM) - 核心数据结构实现
 
-- [ ] **1.7** 手写 `nanovllm/config.py`
-  - [ ] 定义 `Config` 类
-  - [ ] 处理模型路径、并发参数、dtype 等配置
-- [ ] **1.8** 手写 `nanovllm/sampling_params.py`
-  - [ ] 定义 `SamplingParams` 数据类
-  - [ ] 包含 temperature, top_k, top_p, max_tokens 等参数
-- [ ] **1.9** 手写 `nanovllm/engine/sequence.py`
-  - [ ] 定义 `SequenceStatus` 枚举（Waiting/Running/Finished）
-  - [ ] 定义 `Sequence` 类
-  - [ ] 实现 token_ids 管理
-  - [ ] 理解并预留 `block_table` 属性（PagedAttention 伏笔）
-- [ ] **1.10** 手写 `nanovllm/utils/context.py`
-  - [ ] 实现全局上下文管理器
-  - [ ] 用于跨模块传递元数据
+- [✅️] **1.7** 手写 `nanovllm/config.py`
+  - [✅️] 定义 `Config` 类
+  - [✅️] 处理模型路径、并发参数、dtype 等配置
+- [✅️] **1.8** 手写 `nanovllm/sampling_params.py`
+  - [✅️] 定义 `SamplingParams` 数据类
+  - [✅️] 包含 temperature, top_k, top_p, max_tokens 等参数
+- [✅️] **1.9** 手写 `nanovllm/engine/sequence.py`
+  - [✅️] 定义 `SequenceStatus` 枚举（Waiting/Running/Finished）
+  - [✅️] 定义 `Sequence` 类
+  - [✅️] 实现 token_ids 管理
+  - [✅️] 理解并预留 `block_table` 属性（PagedAttention 伏笔）
+- [✅️] **1.10** 手写 `nanovllm/utils/context.py`
+  - [✅️] 实现全局上下文管理器
+  - [✅️] 用于跨模块传递元数据
 
 #### Day 1 检查点 ✅
 
-- [ ] 能够创建 `Config` 实例并打印配置
-- [ ] 能够创建 `Sequence` 实例并管理状态
-- [ ] 理解 Request → Sequence 封装的设计意图
-- [ ] 理解 `block_table` 在后续 PagedAttention 中的作用
+- [✅️] 能够创建 `Config` 实例并打印配置
+- [✅️] 能够创建 `Sequence` 实例并管理状态
+- [✅️] 理解 Request → Sequence 封装的设计意图
+- [✅️] 理解 `block_table` 在后续 PagedAttention 中的作用
 
 ---
 
