@@ -99,35 +99,35 @@ nanovllm/
 
 #### 上午 (AM) - 基础层实现
 
-- [ ] **2.1** 阅读 RMSNorm 论文/博客，理解与 LayerNorm 的区别
-- [ ] **2.2** 手写 `nanovllm/layers/layernorm.py`
-  - [ ] 实现 `RMSNorm` 类
-  - [ ] 注意 eps 参数和权重初始化
-- [ ] **2.3** 阅读 SiLU 激活函数原理
-- [ ] **2.4** 手写 `nanovllm/layers/activation.py`
-  - [ ] 实现 `SiluAndMul` 类（GLU 变体）
-- [ ] **2.5** 深入阅读 RoPE 论文，理解旋转位置编码数学原理
-- [ ] **2.6** 手写 `nanovllm/layers/rotary_embedding.py`
-  - [ ] 实现频率计算 (freqs)
-  - [ ] 实现 apply_rotary_emb 函数
+- [✅️ ] **2.1** 阅读 RMSNorm 论文/博客，理解与 LayerNorm 的区别
+- [ ✅️] **2.2** 手写 `nanovllm/layers/layernorm.py`
+  - [ ✅️] 实现 `RMSNorm` 类
+  - [✅️ ] 注意 eps 参数和权重初始化
+- [ ✅️] **2.3** 阅读 SiLU 激活函数原理
+- [ ✅️] **2.4** 手写 `nanovllm/layers/activation.py`
+  - [ ✅️] 实现 `SiluAndMul` 类（GLU 变体）
+- [ ✅️] **2.5** 深入阅读 RoPE 论文，理解旋转位置编码数学原理
+- [ ✅️] **2.6** 手写 `nanovllm/layers/rotary_embedding.py`
+  - [ ✅️] 实现频率计算 (freqs)
+  - [ ✅️] 实现 apply_rotary_emb 函数
 
 #### 下午 (PM) - 模型骨架搭建
 
-- [ ] **2.7** 阅读 Qwen3/Llama 模型结构，理解各层组成
-- [ ] **2.8** 手写 `nanovllm/models/qwen3.py`（简化版）
-  - [ ] 实现 `Qwen3Attention` 类（先用普通 nn.Linear）
-  - [ ] 实现 `Qwen3MLP` 类
-  - [ ] 实现 `Qwen3DecoderLayer` 类
-  - [ ] 实现 `Qwen3Model` 类（Embedding + Layers + Norm）
-  - [ ] 实现 `Qwen3ForCausalLM` 类（加 lm_head）
-- [ ] **2.9** 编写简单测试：随机输入能否通过 forward
+- [ ✅️] **2.7** 阅读 Qwen3/Llama 模型结构，理解各层组成
+- [ ✅️] **2.8** 手写 `nanovllm/models/qwen3.py`（简化版）
+  - [✅️ ] 实现 `Qwen3Attention` 类（先用普通 nn.Linear）
+  - [ ✅️] 实现 `Qwen3MLP` 类
+  - [✅️ ] 实现 `Qwen3DecoderLayer` 类
+  - [✅️ ] 实现 `Qwen3Model` 类（Embedding + Layers + Norm）
+  - [ ✅️] 实现 `Qwen3ForCausalLM` 类（加 lm_head）
+- [ ✅️] **2.9** 编写简单测试：随机输入能否通过 forward
 
 #### Day 2 检查点 ✅
 
-- [ ] RMSNorm 单元测试通过
-- [ ] RoPE 位置编码计算正确
-- [ ] 模型能完成一次 forward pass（随机权重）
-- [ ] 能清晰解释 RoPE 的数学原理
+- [✅️ ] RMSNorm 单元测试通过
+- [ ✅️] RoPE 位置编码计算正确
+- [ ✅️] 模型能完成一次 forward pass（随机权重）
+- [ ✅️] 能清晰解释 RoPE 的数学原理
 
 ---
 
