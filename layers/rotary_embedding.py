@@ -137,7 +137,7 @@ class RotaryEmbedding(nn.Module):
 
 
 @lru_cache(maxsize=1)
-def get_repo(
+def get_rope(
     head_size: int,
     rotary_dim: int,
     max_position: int,
