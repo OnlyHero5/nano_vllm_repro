@@ -46,7 +46,7 @@ class Block:
     
     def reset(self):
         """重置block， 重新分配时"""
-        self.ref_count = -1
+        self.ref_count = 1
         self.hash = -1
         self.token_ids = []
     
