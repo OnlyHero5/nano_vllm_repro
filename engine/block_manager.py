@@ -295,7 +295,7 @@ class BlockManager:
             assert last_block.hash == -1, "Block already has hash"
 
             token_ids = seq.block(seq.num_blocks - 1)
-            prefix_hash = self.blocks[block_table[-2]].hash
+            prefix_hash = self.blocks[block_table[-2]].hash if len(block_table) > 2 else -1
             current_hash = self.compute_hash(token_ids, prefix_hash)
 
             last_block.update(current_hash, token_ids.copy())
