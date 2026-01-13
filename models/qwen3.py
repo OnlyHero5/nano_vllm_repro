@@ -23,6 +23,7 @@ from transformers import AutoConfig
 from layers.activation import SiluAndMul
 from layers.layernorm import RMSNorm
 from layers.rotary_embedding import get_rope
+from layers.attention import Attention
 
 class Qwen3Attention(nn.Module):
     """Qwen3 注意力层（简化版，无 KV Cache）
@@ -80,24 +81,28 @@ class Qwen3Attention(nn.Module):
             base=rope_theta
         )
 
-        # ===== 可选的 Q/K Norm（Qwen3 特有） =====
-        self.qkv_bias = qkv_bias
-        if not qkv_bias:  # Qwen3 取消了 attention层的 bias ，使用 QK Norm
-            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        # =====  Q/K Norm（Qwen3 特有） =====
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
-    
+        # ===== PagedAttention =====
+        self.attn = Attention(
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            scale=self.scaling,
+            num_kv_heads=self.num_kv_heads
+        )
+
+
     def forward(
             self,
             positions: torch.Tensor,
             hidden_states: torch.Tensor,
-            attention_mask: torch.Tensor
     ) -> torch.Tensor:
         """
         Args:
             positions: [num_tokens] 位置索引
             hidden_states: [num_tokens, hidden_size]
-            attention_mask: [num_tokens, num_tokens] 可选的因果掩码
         
         Returns:
             [num_tokens, hidden_size]
@@ -113,47 +118,49 @@ class Qwen3Attention(nn.Module):
         k = k.view(num_tokens, self.num_kv_heads, self.head_dim)
         v = v.view(num_tokens, self.num_kv_heads, self.head_dim)
 
-        # ===== 可选的 Q / K Norm =====
-        if not self.qkv_bias:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+        # =====  Q / K Norm =====
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         
         # ===== RoPE 位置编码 =====
         q, k = self.rotary_emb(positions, q, k)
 
-        # ===== GQA：扩展KV头数以匹配Q头数
-        if self.num_kv_heads < self.num_heads:
-            # 每个 K V 头复制多少次
-            repeat_times = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(repeat_times, dim=1)
-            v = v.repeat_interleave(repeat_times, dim=1)
+        # # ===== GQA：扩展KV头数以匹配Q头数
+        # if self.num_kv_heads < self.num_heads:
+        #     # 每个 K V 头复制多少次
+        #     repeat_times = self.num_heads // self.num_kv_heads
+        #     k = k.repeat_interleave(repeat_times, dim=1)
+        #     v = v.repeat_interleave(repeat_times, dim=1)
         
-        # ===== 计算注意力 =====
-        # 转换为 [batch=1, num_heads, num_tokens, head_dim]
-        # TODO : flash attention实现
-        q = q.transpose(0, 1).unsqueeze(0)
-        k = k.transpose(0, 1).unsqueeze(0)
-        v = v.transpose(0, 1).unsqueeze(0)
+        # # ===== 计算注意力 =====
+        # # 转换为 [batch=1, num_heads, num_tokens, head_dim]
+        # # TODO : flash attention实现
+        # q = q.transpose(0, 1).unsqueeze(0)
+        # k = k.transpose(0, 1).unsqueeze(0)
+        # v = v.transpose(0, 1).unsqueeze(0)
 
-        # 缩放点积注意力
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
+        # # 缩放点积注意力
+        # attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
 
-        # 因果掩码
-        if attention_mask is None:
-            # 创建因果掩码
-            attention_mask = torch.triu(
-                torch.full((num_tokens, num_tokens), float("-inf"), device=q.device),
-                diagonal=1
-            )
-        attn_weights = attn_weights + attention_mask
+        # # 因果掩码
+        # if attention_mask is None:
+        #     # 创建因果掩码
+        #     attention_mask = torch.triu(
+        #         torch.full((num_tokens, num_tokens), float("-inf"), device=q.device),
+        #         diagonal=1
+        #     )
+        # attn_weights = attn_weights + attention_mask
 
-        # Softmax + 加权求和
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.device)
-        attn_output = torch.matmul(attn_weights, v)
+        # # Softmax + 加权求和
+        # attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.device)
+        # attn_output = torch.matmul(attn_weights, v)
 
-        # 转换回 [num_tokens, num_heads, head_dim]
-        attn_output = attn_output.squeeze(0).transpose(0, 1)
+        # # 转换回 [num_tokens, num_heads, head_dim]
+        # attn_output = attn_output.squeeze(0).transpose(0, 1)
 
+        # ===== Attention层 =====
+        attn_output = self.attn(q, k, v)
+        
         # ===== 输出投影 =====
         output = self.o_proj(attn_output.reshape(num_tokens, -1))
 
@@ -236,7 +243,6 @@ class Qwen3DecoderLayer(nn.Module):
             positions: torch.Tensor,
             hidden_states: torch.Tensor,
             residual: torch.Tensor | None = None,
-            attention_mask: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -255,7 +261,7 @@ class Qwen3DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         
-        hidden_states = self.self_attn(positions, hidden_states, attention_mask)
+        hidden_states = self.self_attn(positions, hidden_states)
 
         # ===== Post-Norm + MLP =====
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
