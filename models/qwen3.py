@@ -327,6 +327,19 @@ class Qwen3ForCausalLM(nn.Module):
     """
     Qwen3 因果语言模型 （完整模型）
     """
+
+    # ====== 融合权重映射模型 =====
+    packed_modules_mapping = {
+        # Q K V 融合部分
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        # Gate-UP 融合
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1)
+    }
+
+
     def __init__(self, config) -> None:
         super().__init__()
         self.config = config
