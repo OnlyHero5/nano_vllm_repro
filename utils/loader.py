@@ -84,7 +84,7 @@ def load_model(model: nn.Module, model_path: str):
                 for original_name, (packed_name, shard_id) in packed_modules_mapping.items():
                     if original_name in weight_name:
                         # 需要融合的层
-                        param_name = weight_name.replace(original_name, packed_modules_mapping)
+                        param_name = weight_name.replace(original_name, packed_name)
                         try:
                             param = model.get_parameter(param_name)
                         except AttributeError:
