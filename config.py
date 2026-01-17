@@ -11,7 +11,7 @@ class Config:
     """
 
     # 模型路径
-    model: str
+    model_path: str
 
     # 连续批处理 相关参数
     max_num_batched_tokens: int = 16384     #单批次最大token数
@@ -41,7 +41,7 @@ class Config:
         """
 
         # 1. 校验模型路径
-        assert os.path.isdir(self.model), f"模型路径不存在：{self.model}"
+        assert os.path.isdir(self.model_path), f"模型路径不存在：{self.model_path}"
 
         # 2. 块大小必须是256的倍数 （FlashAttention优化要求）
         assert self.kvcache_block_size % 256 == 0, f"kvcache_block_size 必须是 256 的倍数"
@@ -50,7 +50,7 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8 , "张量并行必须在1-8之间 单机"
 
         # 4. 自动加载huggingface 模型配置
-        self.hf_config = AutoConfig.from_pretrained(self.model)
+        self.hf_config = AutoConfig.from_pretrained(self.model_path)
 
         # 5. 上下文长度 配置文件和模型支持的最小值
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
