@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import torch
 
+from typing import Optional
 
 
 @dataclass
@@ -26,45 +27,33 @@ class Context:
     slot_mapping: torch.Tensor | None = None    # token -> cache slot 映射
 
     # ===Decode===
-    context_lens: torch.Tensor | None = None    # 每个序列的上下文长度
-    block_tables: torch.Tensor | None = None    # 所有序列的block_size
+    context_lens: torch.Tensor | None = None    # 每个序列的上下文长度 [num_seqs]
+    block_tables: torch.Tensor | None = None    # 所有序列的block_size [num_seqs, max_blocks]
+    max_context_len: int = None # 最大上下文长度
+    max_num_blocks: int = None # 最大块数
+
+    # ===== KV Cache 引用 =====
+    kv_cache: Optional[list[torch.Tensor]] = None # [num_layers] 每层的KV cache
 
 # 全局单例
-_CONTEXT = Context()
+_current_context = Context()
 
 
 def get_context() -> Context:
     """获取当前上下文"""
-    return _CONTEXT
+    global _current_context
+    if _current_context is None:
+        raise RuntimeError("Context not set. Call set_context() first")
 
 
 
-def set_context(
-    is_prefill: bool,
-    cu_seqlens_q: torch.Tensor | None = None,
-    cu_seqlens_k: torch.Tensor | None = None,
-    max_seqlen_q: int = 0,
-    max_seqlen_k: int = 0,
-    slot_mapping: torch.Tensor | None = None,
-    context_lens: torch.Tensor | None = None,
-    block_tables: torch.Tensor | None = None,
-):
-    """设置上下文（每次推理前调用）"""
-    global _CONTEXT
-    _CONTEXT = Context(
-        is_prefill=is_prefill,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        slot_mapping=slot_mapping,
-        context_lens=context_lens,
-        block_tables=block_tables
-    )
+def set_context(context: Context):
+    "设置当前上下文"
+    global _current_context
+    _current_context = context
 
 
-
-def reset_context():
-    """重置上下文（推理结束后）"""
+def clear_context():
+    """清除当前上下文"""
     global _CONTEXT
     _CONTEXT = Context()
