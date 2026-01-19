@@ -24,14 +24,16 @@ from layers.activation import SiluAndMul
 from layers.layernorm import RMSNorm
 from layers.rotary_embedding import get_rope
 from layers.attention import Attention
+from layers.linear import QKVLinear, MergedLinear, RowLinear
 
 class Qwen3Attention(nn.Module):
-    """Qwen3 注意力层（完整包括 KV Cache）
+    """Qwen3 注意力层
     
     特点:
     - Grouped Query Attention (GQA): num_kv_heads < num_heads
-    - 可选的 Q/K Norm
+    - Q/K Norm（Qwen3 特有，始终启用）
     - RoPE 位置编码
+    - PagedAttention 支持
     """
      
     def __init__(
@@ -40,10 +42,11 @@ class Qwen3Attention(nn.Module):
             num_heads: int,
             num_kv_heads: int,
             head_dim: int | None = None,
-            max_position: int = 4096*32,
+            max_position: int = 4096 * 32,
             rms_norm_eps: float = 1e-6,
             qkv_bias: bool = False,
-            rope_theta: float = 1000000.0
+            rope_theta: float = 1000000.0,
+            layer_idx: int = 0
     ) -> None:
         super().__init__()
 
@@ -60,14 +63,14 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim ** (-0.5)
 
         # ===== 投影层 =====
-        # Q K V 融合成一个线性层, 融合算法优化CUDA效率
-        self.qkv_proj = nn.Linear(
-            hidden_size,
-            self.q_size + 2 * self.kv_size,
+        self.qkv_proj = QKVLinear(
+            hidden_size=hidden_size,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
             bias=qkv_bias
         )
-        # 输出投影
-        self.o_proj = nn.Linear(
+        self.o_proj = RowLinear(
             self.q_size,
             hidden_size,
             bias=False
@@ -90,7 +93,8 @@ class Qwen3Attention(nn.Module):
             num_heads=self.num_heads,
             head_dim=self.head_dim,
             scale=self.scaling,
-            num_kv_heads=self.num_kv_heads
+            num_kv_heads=self.num_kv_heads,
+            layer_idx=layer_idx,
         )
 
 
@@ -183,8 +187,17 @@ class Qwen3MLP(nn.Module):
         super().__init__()
 
         # gate 和 up 融合成一个线性层
-        self.gate_up_proj = nn.Linear(hidden_size, intermediate_size*2, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.gate_up_proj = MergedLinear(
+            input_size=hidden_size,
+            output_size=intermediate_size,
+            num_shards=2,
+            bias=False
+        )
+        self.down_proj = RowLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False
+        )
         self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -210,7 +223,7 @@ class Qwen3DecoderLayer(nn.Module):
                               ↓
                            RMSNorm → MLP → + (残差)
     """
-    def __init__(self, config) -> None:
+    def __init__(self, config, layer_idx: int = 0) -> None:
         super().__init__()
 
         self.self_attn = Qwen3Attention(
@@ -220,8 +233,9 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=getattr(config, 'head_dim', None),
             max_position=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, 'attention_bias', True),
-            rope_theta=getattr(config, 'rope_theta', 100_0000.0)
+            qkv_bias=getattr(config, 'attention_bias', False),
+            rope_theta=getattr(config, 'rope_theta', 100_0000.0),
+            layer_idx=layer_idx
         )
 
         self.mlp = Qwen3MLP(
@@ -284,7 +298,7 @@ class Qwen3Model(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [
-                Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)
+                Qwen3DecoderLayer(config,layer_idx=i) for i in range(config.num_hidden_layers)
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -293,13 +307,11 @@ class Qwen3Model(nn.Module):
             self,
             input_ids: torch.Tensor,
             positions: torch.Tensor | None = None,
-            attention_mask: torch.Tensor | None = None
     ) -> torch.Tensor:
         """
         Args:
             input_ids: [num_tokens] token ID
             positions: [num_tokens] 位置索引， 若为 None 则自动生成
-            attention_mask: 因果索引
         
         Returns:
             [num_tokens, hidden_size]
@@ -314,7 +326,7 @@ class Qwen3Model(nn.Module):
         # 逐层处理
         residual = None
         for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, residual, attention_mask)
+            hidden_states, residual = layer(positions, hidden_states, residual)
         
         # 最终归一化
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -358,10 +370,9 @@ class Qwen3ForCausalLM(nn.Module):
             self,
             input_ids: torch.Tensor,
             positions: torch.Tensor | None = None,
-            attention_mask: torch.Tensor | None = None
     ) -> torch.Tensor:
         """返回logits"""
-        hidden_states = self.model(input_ids, positions, attention_mask)
+        hidden_states = self.model(input_ids, positions)
         logits = self.lm_head(hidden_states)
         return logits
     

@@ -128,7 +128,7 @@ class Attention(nn.Module):
             head_dim: int,
             scale: float,
             num_kv_heads: int,
-            layer_idx: int = 0
+            layer_idx: int = 0,
     ):
         super().__init__()
         self.num_heads = num_heads
