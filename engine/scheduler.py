@@ -137,6 +137,8 @@ class Scheduler:
         # 将处理的序列放回running队列头部
         for seq in reversed(decoded_seqs):
             self.running.appendleft(seq)
+        
+        return decoded_seqs, False
 
     def __preempt(self, seq: Sequence):
         """抢占序列（释放其 KV Cache）
