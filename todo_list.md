@@ -176,39 +176,39 @@ nanovllm/
 
 #### 上午 (AM) - 调度器实现
 
-- [ ] **4.1** 阅读 vLLM 论文中的调度策略部分
-- [ ] **4.2** 理解 Continuous Batching vs Static Batching
-- [ ] **4.3** 手写 `nanovllm/engine/scheduler.py`
-  - [ ] 维护 `waiting` 队列
-  - [ ] 维护 `running` 队列
-  - [ ] 实现 `add_sequence()` 方法
-  - [ ] 实现 `schedule()` 方法
-    - [ ] 检查显存是否足够
-    - [ ] 将 waiting 序列移到 running
-    - [ ] 调用 BlockManager 分配块
-  - [ ] 实现 `postprocess()` 方法
-    - [ ] 处理已完成的序列
-    - [ ] 释放对应的块
+- [ ✅️] **4.1** 阅读 vLLM 论文中的调度策略部分
+- [ ✅️] **4.2** 理解 Continuous Batching vs Static Batching
+- [ ✅️] **4.3** 手写 `nanovllm/engine/scheduler.py`
+  - [ ✅️] 维护 `waiting` 队列
+  - [ ✅️] 维护 `running` 队列
+  - [ ✅️] 实现 `add_sequence()` 方法
+  - [ ✅️] 实现 `schedule()` 方法
+    - [ ✅️] 检查显存是否足够
+    - [ ✅️] 将 waiting 序列移到 running
+    - [ ]✅️ 调用 BlockManager 分配块
+  - [ ✅️] 实现 `postprocess()` 方法
+    - [ ✅️] 处理已完成的序列
+    - [ ✅️] 释放对应的块
 
 #### 下午 (PM) - ModelRunner 基础版
 
-- [ ] **4.4** 手写 `nanovllm/engine/model_runner.py`（基础版）
-  - [ ] 实现 `__init__` - 加载模型和 tokenizer
-  - [ ] 实现 `allocate_kv_cache()` - 预分配 GPU 显存
-  - [ ] 实现 `prepare_input()` 方法
-    - [ ] 将多个 Sequence 的 token 拼成 batch
-    - [ ] 生成 attention_mask
-    - [ ] 生成 position_ids
-    - [ ] 构建 block_tables tensor
-  - [ ] 实现基础 `run()` 方法 - 执行 forward
-- [ ] **4.5** 理解调度器如何与 BlockManager 交互
+- [ ✅️] **4.4** 手写 `nanovllm/engine/model_runner.py`（基础版）
+  - [ ✅️] 实现 `__init__` - 加载模型和 tokenizer
+  - [ ✅️] 实现 `allocate_kv_cache()` - 预分配 GPU 显存
+  - [ ✅️] 实现 `prepare_input()` 方法
+    - [ ✅️] 将多个 Sequence 的 token 拼成 batch
+    - [ ✅️] 生成 attention_mask
+    - [ ✅️] 生成 position_ids
+    - [ ✅️] 构建 block_tables tensor
+  - [ ✅️] 实现基础 `run()` 方法 - 执行 forward
+- [ ✅️] **4.5** 理解调度器如何与 BlockManager 交互
 
 #### Day 4 检查点 ✅
 
-- [ ] 调度器能正确管理 waiting/running 队列
-- [ ] 能根据显存情况做出调度决策
-- [ ] ModelRunner 能正确准备 batch 输入
-- [ ] 理解 Continuous Batching 的优势
+- [ ✅️] 调度器能正确管理 waiting/running 队列
+- [ ✅️] 能根据显存情况做出调度决策
+- [ ✅️] ModelRunner 能正确准备 batch 输入
+- [ ✅️] 理解 Continuous Batching 的优势
 
 ---
 
