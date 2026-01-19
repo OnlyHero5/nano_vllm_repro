@@ -59,5 +59,8 @@ class Config:
         assert self.max_num_batched_tokens >= self.max_model_len, "max_num_batched_tokens 必须 >= max_model_len"
 
         
-
+    @property
+    def model(self) -> str:
+        """别名"""
+        return self.model_path
 

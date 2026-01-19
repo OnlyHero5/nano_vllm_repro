@@ -66,6 +66,8 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         self.waiting.append(seq)
     
+    add = add_sequence # 别名
+    
     def schedule(self) -> Tuple[List[Sequence], bool]:
         """核心调度方法
         
