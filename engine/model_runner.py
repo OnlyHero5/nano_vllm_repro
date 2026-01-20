@@ -83,7 +83,7 @@ class ModelRunner:
         load_model(model, self.config.model_path)
 
         # 迁移至GPU 并设置为评估模式
-        model = model.to(self.device)
+        model = model.to(self.device, dtype=torch.bfloat16)
         model.eval()
 
         print(f"[ModelRunner] 模型加载完成，设备：{self.device}")
