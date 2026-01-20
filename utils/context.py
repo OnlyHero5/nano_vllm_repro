@@ -61,6 +61,7 @@ def get_context() -> Context:
     global _current_context
     if _current_context is None:
         raise RuntimeError("Context not set. Call set_context() first")
+    return _current_context
 
 
 
@@ -72,5 +73,5 @@ def set_context(context: Context):
 
 def clear_context():
     """清除当前上下文"""
-    global _CONTEXT
-    _CONTEXT = Context()
+    global _current_context
+    _current_context = Context()
