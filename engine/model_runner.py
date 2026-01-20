@@ -83,57 +83,40 @@ class ModelRunner:
         load_model(model, self.config.model_path)
 
         # 迁移至GPU 并设置为评估模式
-        model = model.to(self.device)
+        # 必须指定dtype=torch.bfloat16，否则flash-attention会出错（或产生次优结果）
+        model = model.to(self.device, dtype=torch.bfloat16) 
         model.eval()
 
         print(f"[ModelRunner] 模型加载完成，设备：{self.device}")
         return model
     
     def allocate_kv_cache(self, num_blocks: int):
-        """预分配 KV Cache 显存
+        """预分配 KV Cache 显存"""
+        # 计算维度
+        D = self.num_kv_heads * self.head_dim
         
-        KV Cache 结构：每层一个 tensor
-        Shape: [2, num_blocks, block_size, num_kv_heads, head_dim]
-        - 2: K 和 V
-        - num_blocks: 总块数
-        - block_size: 每块的 token 数（如 16）
-        - num_kv_heads: KV 头数（GQA）
-        - head_dim: 每个头的维度
-        
-        显存计算：
-        每层: 2 * num_blocks * block_size * num_kv_heads * head_dim * 2 bytes (fp16)
-        总计: num_layers * 上述值
-        
-        Args:
-            num_blocks: 要分配的块数
-        """
-        
-        # 计算显存需求
-        bytes_per_block = (
-            2 * 
-            self.block_size *
-            self.num_kv_heads *
-            self.head_dim * 
-            2
+        # 分配为 [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+        self.kv_cache = torch.zeros(
+            2,
+            self.num_layers,
+            num_blocks,
+            self.block_size,
+            self.num_kv_heads,
+            self.head_dim,
+            dtype=torch.float16,
+            device=self.device
         )
-        total_bytes = self.num_layers * num_blocks * bytes_per_block
-        print(f"[ModelRunner] KV Cache 显存需求：{total_bytes / 1024**3:.2f} GB")
-
-        # 分配
-        self.kv_cache = []
-        for _ in range(self.num_layers):
-            # [2, num_blocks, block_size, num_kv_heads, head_dim]
-            cache = torch.zeros(
-                2,
-                num_blocks,
-                self.block_size,
-                self.num_kv_heads,
-                self.head_dim,
-                dtype=torch.float16,
-                device=self.device
-            )
-            self.kv_cache.append(cache)
-
+    
+        # 关键：将每层的cache view赋给对应的Attention层
+        layer_id = 0
+        for module in self.model.modules():
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                # 每层的cache形状: [num_blocks, block_size, num_kv_heads, head_dim]
+                # 需要reshape为 [num_slots, D] 供 flash_attn_with_kvcache 使用
+                module.k_cache = self.kv_cache[0, layer_id]
+                module.v_cache = self.kv_cache[1, layer_id]
+                layer_id += 1
+    
         print(f"[ModelRunner] KV Cache 分配完成：{num_blocks} 块 × {self.num_layers} 层")
 
     def get_num_free_gpu_blocks(self) -> int:

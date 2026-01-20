@@ -81,7 +81,7 @@ class LLMEngine:
         
         # Tokenize
         if isinstance(prompt, str):
-            token_ids = self.tokenizer.encode(prompt)
+            token_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
         else:
             token_ids = list(prompt)
         

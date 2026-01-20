@@ -34,7 +34,7 @@ class RMSNorm(nn.Module):
         # 可学习的缩放参数，初始化为全1
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    @torch.compile
+    # @torch.compile
     def rms_forward(
         self,
         x: torch.Tensor,
@@ -65,7 +65,7 @@ class RMSNorm(nn.Module):
 
         return x
 
-    @torch.compile
+    # @torch.compile
     def add_rms_forward(
         self,
         x: torch.Tensor,

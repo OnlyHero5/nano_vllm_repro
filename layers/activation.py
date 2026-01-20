@@ -32,7 +32,7 @@ class SiluAndMul(nn.Module):
     def __init__(self):
         super().__init__()
     
-    @torch.compile()
+    # @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
