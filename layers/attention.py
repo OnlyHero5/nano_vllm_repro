@@ -193,6 +193,7 @@ class Attention(nn.Module):
             context: Context
     ) -> torch.Tensor:
         """Decode: 使用 flash_attn_with_kvcache"""
+        original_dtype = q.dtype
         kv_cache = context.kv_cache[self.layer_idx]
         k_cache = kv_cache[0] # [num_blocks, block_size, num_kv_heads, head_dim]
         v_cache = kv_cache[1]
@@ -211,6 +212,6 @@ class Attention(nn.Module):
         )
 
         # [num_seqs, 1, num_heads, head_dim] -> [num_seqs, num_heads, head_dim]
-        return output.squeeze(1).to(q.dtype)
+        return output.squeeze(1).to(original_dtype)
     
     
