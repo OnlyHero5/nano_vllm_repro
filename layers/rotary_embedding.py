@@ -41,7 +41,17 @@ def apply_rotary_emb(
     Returns:
         旋转后的向量，形状不变
     """
-    # 将向量分成两半
+    # 尝试 Interleaved RoPE (GPT-NeoX 风格)
+    # shape = x.shape
+    # x_reshaped = x.view(*shape[:-1], -1, 2)
+    # x1 = x_reshaped[..., 0]
+    # x2 = x_reshaped[..., 1]
+    # y1 = x1 * cos - x2 * sin
+    # y2 = x2 * cos + x1 * sin
+    # ret = torch.stack([y1, y2], dim=-1).flatten(-2)
+    # return ret.to(x.dtype)
+    
+    # 将向量分成两半 (Standard LLaMA Style)
     # 每半维度是 head_dim // 2
     x1, x2 = torch.chunk(x.float(), 2, dim=-1)
 
@@ -105,7 +115,7 @@ class RotaryEmbedding(nn.Module):
         # 注册为buffer，不进行梯度计算， 随模型保存、加载
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-    @torch.compile
+    # @torch.compile
     def forward(
         self,
         positions: torch.Tensor,
@@ -134,7 +144,6 @@ class RotaryEmbedding(nn.Module):
         key = apply_rotary_emb(key, cos, sin)
 
         return query, key
-
 
 @lru_cache(maxsize=1)
 def get_rope(
