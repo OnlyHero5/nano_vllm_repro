@@ -73,5 +73,9 @@ def set_context(context: Context):
 
 def clear_context():
     """清除当前上下文"""
+    reset_context()
+
+def reset_context():
+    """重置上下文（CUDA Graph 录制后需要调用）"""
     global _current_context
     _current_context = Context()
