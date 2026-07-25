@@ -1,6 +1,7 @@
 """Day 4 完整测试"""
 import sys
-sys.path.insert(0, '/home/psx/nano_vllm_repro/nano_vll_repro')
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 import torch
 

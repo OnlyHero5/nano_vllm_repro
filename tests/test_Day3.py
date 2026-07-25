@@ -7,7 +7,7 @@ import torch
 from engine.sequence import Sequence, SequenceStatus
 from engine.block_manager import Block, BlockManager
 from layers.attention import Attention, store_kvcache
-from utils.context import set_context, reset_context
+from utils.context import Context, set_context, reset_context
 from sampling_params import SamplingParams
 
 
@@ -216,16 +216,16 @@ def test_attention_with_context():
     
     # 设置 Context（无 KV Cache 的简单情况）
     cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
-    set_context(
+    set_context(Context(
         is_prefill=True,
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_k=cu_seqlens,
         max_seqlen_q=num_tokens,
         max_seqlen_k=num_tokens,
         slot_mapping=torch.arange(num_tokens),
-    )
-    
-    # Forward（不使用 FlashAttention，使用 PyTorch fallback）
+    ))
+
+    # Forward（走 FlashAttention prefill 路径）
     output = attn(q, k, v)
     print(f"Prefill 输入 Q: {q.shape}")
     print(f"Prefill 输出: {output.shape}")
@@ -251,20 +251,21 @@ def test_store_kvcache():
     # 创建测试数据
     key = torch.randn(num_tokens, num_kv_heads, head_dim).cuda()
     value = torch.randn(num_tokens, num_kv_heads, head_dim).cuda()
-    
-    k_cache = torch.zeros(num_blocks, block_size, num_kv_heads, head_dim).cuda()
-    v_cache = torch.zeros(num_blocks, block_size, num_kv_heads, head_dim).cuda()
-    
+
+    # 合并的 KV Cache：[2, num_blocks, block_size, num_kv_heads, head_dim]
+    # （与 ModelRunner.allocate_kv_cache 的真实布局一致，2表示 K 和 V）
+    kv_cache = torch.zeros(2, num_blocks, block_size, num_kv_heads, head_dim).cuda()
+
     # slot mapping: 假设 tokens 分布在 block 1 (slots 4-7) 和 block 2 (slots 8-9)
     slot_mapping = torch.tensor([4, 5, 6, 7, 8, 9], device='cuda')
-    
-    # 存储
-    store_kvcache(key, value, k_cache, v_cache, slot_mapping)
-    
-    # 验证
-    k_cache_flat = k_cache.view(-1, num_kv_heads, head_dim)
-    v_cache_flat = v_cache.view(-1, num_kv_heads, head_dim)
-    
+
+    # 存储（4 参签名：k, v, 合并 kv_cache, slot_mapping）
+    store_kvcache(key, value, kv_cache, slot_mapping)
+
+    # 验证（从合并 cache 的 K/V 两半读取）
+    k_cache_flat = kv_cache[0].view(-1, num_kv_heads, head_dim)
+    v_cache_flat = kv_cache[1].view(-1, num_kv_heads, head_dim)
+
     for i, slot in enumerate(slot_mapping.tolist()):
         assert torch.allclose(k_cache_flat[slot], key[i]), f"Key mismatch at slot {slot}"
         assert torch.allclose(v_cache_flat[slot], value[i]), f"Value mismatch at slot {slot}"

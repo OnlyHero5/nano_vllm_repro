@@ -1,29 +1,18 @@
-# 08. 实现 Chunked Prefill 与 v1 调度策略
+# Day 8 — Chunked Prefill：别让长 prompt 堵死整个 batch
 
-这一篇开始吸收主线 `00~07` 之外的新能力，但仍然必须站在当前仓库的真实代码边界上。
+想象这个场景：waiting 队列头部排着一条 8000 token 的长 prompt，后面跟着三条十几个 token 的短请求。当前调度器的做法是——8000 token 塞不下？那谁也别上车。三条短请求继续干等。
 
-这一篇只做两件事：
+这不太公平。
 
-> 1. 把当前“整段 prompt 一次性 prefill”的调度方式，升级成“可以分块推进的 chunked prefill”。
-> 2. 让 `Scheduler` 和 `ModelRunner` 能围绕“还有多少 prefill token 没算完”来协同工作。
+chunked prefill 的思路很直白：**长 prompt 不必一次全算完，拆成几段，每轮只推进一段。** 这轮算 1024 个 token，下轮再算 1024 个，省下来的 budget 留给 decode 请求。
 
-这一篇不做下面这些事：
-
-- 不引入 speculative decoding。
-- 不引入 MoE。
-- 不引入新的 Attention kernel。
-- 不改 `layers/attention.py` 的 FlashAttention 调用协议。
-- 不把当前 `Sequence` 变成另一个完全不同的请求对象。
-
-原因很简单：
-
-> `chunked prefill` 的核心不是换模型，也不是换 kernel，而是把“prefill 这件事”从“一次性把整段 prompt 全算完”改成“按照 token budget 分段推进”。
+这次改的是调度和输入准备这条线——模型、kernel、attention 协议都不碰。
 
 ---
 
-## 1. 为什么现在要补 chunked prefill
+## 1. 当前 prefill 路径的问题
 
-当前仓库在 `engine/scheduler.py` 里的 prefill 路径是“整条序列优先、整段 prompt 一次性上车”。核心判断是：
+`engine/scheduler.py` 里的 prefill 判断长这样：
 
 ```python
 new_tokens = len(seq) - seq.num_cached_tokens
@@ -31,65 +20,29 @@ if num_batched_tokens + new_tokens > self.max_num_batched_tokens:
     break
 ```
 
-它的优点是简单，缺点也很明显：
+简单，但有三个毛病：
 
-1. **长 prompt 容易卡住 batch。**
-   如果 waiting 队列头部有一条很长的请求，它可能直接吃掉本轮大部分 token budget。
-2. **prefill 和 decode 的公平性较差。**
-   新请求一旦足够长，会持续拖住 decode 请求，导致 running 队列里已经在生成的序列得不到足够执行机会。
-3. **prefix cache 命中时虽然会减少 `new_tokens`，但仍然是“按整条剩余 prompt 一次性尝试调度”。**
+1. **长 prompt 卡死 batch。** waiting 队头一条 8000 token 的请求，直接吃掉本轮全部 budget，后面的短请求干瞪眼。
+2. **prefill 和 decode 抢资源。** 新请求一长，running 队列里正在生成的序列就被饿着。
+3. **prefix cache 命中也没用。** 虽然 `num_cached_tokens` 会减小 `new_tokens`，但调度器仍然是”整条剩余 prompt 一次性尝试塞入”。
 
-`chunked prefill` 的思路是：
-
-> 不再要求“一个 prefill 请求必须一次算完剩余所有 prompt token”，而是允许它在本轮只处理其中一个 chunk，下一轮再继续处理剩下的 prompt token。
-
-这和社区里 2026 年前后的 nano-vllm 扩展仓、以及 vLLM v1 风格调度思路是一致的：
-
-- token budget 是本轮的核心资源。
-- prefill 请求可以被切成多个 prefill step。
-- decode 不再总是被长 prompt 挤压。
+chunked prefill 的改法：**允许一条 prefill 请求这轮只处理一部分 prompt token，下轮接着来。** 这和 vLLM v1 的调度思路一致——token budget 是本轮的核心资源，prefill 可以被切成多个 step，decode 不再总被长 prompt 挤压。
 
 ---
 
-## 2. 当前代码是什么状态
+## 2. 当前代码的四个相关点
 
-当前与 prefill 直接相关的地方有四个：
+和 prefill 直接相关的有四个文件：
 
-1. `engine/sequence.py`
-2. `engine/scheduler.py`
-3. `engine/model_runner.py`
-4. `engine/llm_engine.py`
+### 2.1 `Sequence`：有总账，没细账
 
-### 2.1 `Sequence` 当前只有“总 token”和“已缓存 token”
+当前 `Sequence` 已经有 `token_ids`、`num_prompt_tokens`、`num_cached_tokens`、`block_table`——能表达”一共多少 token，多少已进 cache”。但缺一个关键问题：**本轮该处理到哪？**
 
-当前 `Sequence` 已经有：
+### 2.2 `Scheduler.schedule()`：整条 prompt 一次性尝试装入
 
-- `token_ids`
-- `num_prompt_tokens`
-- `num_cached_tokens`
-- `block_table`
+waiting 路径是：取队首 → 算 `new_tokens` → 塞不下就 `break`。队头那条长请求一旦塞不下，后面更短的请求全部被卡住。
 
-这很好，因为它已经能表达：
-
-> 这条请求一共有多少 token，其中有多少 token 已经进入 KV Cache。
-
-但当前它还没有一个明确的“本轮 prefill 该处理到哪”的辅助接口。
-
-### 2.2 `Scheduler.schedule()` 现在是整条 prompt 一次性尝试装入
-
-现在的 waiting 路径是：
-
-- 取队首序列。
-- 算 `new_tokens = len(seq) - seq.num_cached_tokens`。
-- 如果剩余 prompt token 总数塞不下，就直接 `break`。
-
-这就意味着：
-
-> waiting 队列头部那条请求，如果剩余 prompt 太长，会直接卡住后面更短的请求。
-
-### 2.3 `ModelRunner.prepare_prefill()` 现在总是把整条 `seq.token_ids` 全部送进模型
-
-当前版本会这样做：
+### 2.3 `ModelRunner.prepare_prefill()`：总是送整条 `seq.token_ids`
 
 ```python
 token_ids = seq.token_ids
@@ -98,51 +51,33 @@ all_token_ids.extend(token_ids)
 all_positions.extend(range(seq_len))
 ```
 
-这对应的是“全量 prefill”，而不是“只 prefill 还没算过的那一段 chunk”。
+这是”全量 prefill”，不是”只 prefill 还没算过的那一段”。
 
-### 2.4 `LLMEngine.step()` 的吞吐统计也还是按“整条 prefill”口径在想
+### 2.4 `LLMEngine.step()`：吞吐统计也按整条 prefill 在算
 
-所以这篇必须同时改调度与输入准备，否则会出现一个典型错误：
-
-> 调度器以为自己切 chunk 了，`ModelRunner` 却还是把整条 prompt 重新送进模型。
+所以这篇必须同时改调度和输入准备。只改一头就会出现经典翻车：调度器以为自己切了 chunk，`ModelRunner` 还是把整条 prompt 重新送进模型。
 
 ---
 
-## 3. 先明确 chunked prefill 的新账本
+## 3. chunked prefill 的账本：三个数字
 
-在当前仓库里，我们不新增复杂请求对象，只在 `Sequence` 上补齐一组清楚的运行时语义。
-
-### 3.1 必须分清三个数字
-
-对每条序列，后面要长期区分这三个量：
+不新增复杂请求对象，只在 `Sequence` 上补齐一组运行时语义。关键是分清三个量：
 
 1. `num_prompt_tokens`：原始 prompt 长度。
-2. `num_cached_tokens`：已经进入 KV Cache 的 prompt token 数。
-3. `num_uncomputed_tokens`：还没做 prefill 计算的 prompt token 数。
-
-在当前仓库语义里：
+2. `num_cached_tokens`：已进 KV Cache的 prompt token 数。
+3. `num_uncomputed_tokens`：还没做 prefill 的 prompt token 数。
 
 ```python
 num_uncomputed_tokens = seq.num_prompt_tokens - seq.num_cached_tokens
 ```
 
-注意，这里只看 prompt 部分。decode 生成出来的新 token 不属于“等待 prefill 的 prompt token”。
+只看 prompt 部分——decode 生成的新 token 不算在内。
 
-### 3.2 chunked prefill 的关键不是拆 block，而是拆本轮输入窗口
+###3.1 不是拆序列，是拆本轮输入窗口
 
-很多人第一次看 chunked prefill，会误以为：
+第一次看 chunked prefill 容易想歪：是不是要把 `token_ids` 切成几个子序列对象？
 
-> 是不是要把 `Sequence.token_ids` 真正切成几个子序列对象？
-
-这里不需要。更稳的做法是：
-
-- `Sequence.token_ids` 继续保存完整 token 序列。
-- `num_cached_tokens` 继续表示“prompt 前缀里已经进 cache 的部分”。
-- 每一轮由调度器决定这条请求这次最多再前进多少个 prompt token。
-
-也就是说：
-
-> chunked prefill 更像“给现有序列指定一个本轮处理窗口”，而不是“重新发明序列对象”。
+不用。`token_ids` 继续保存完整序列，`num_cached_tokens` 继续标记”前缀里已进 cache 的部分”，每轮由调度器决定这次最多再前进多少 token。chunked prefill 是给现有序列指定一个本轮处理窗口，不是重新发明序列对象。
 
 ---
 
@@ -150,7 +85,7 @@ num_uncomputed_tokens = seq.num_prompt_tokens - seq.num_cached_tokens
 
 ### 4.1 增加 chunked prefill 辅助属性
 
-下面是可以直接加入 `Sequence` 类的完整方法块。它不改变当前类的构造协议，只补充 prompt 账本查询能力。
+把下面这组方法加入 `Sequence`类。构造协议不变，只是补上 prompt 账本查询能力。
 
 ```python
 @property
@@ -198,56 +133,45 @@ def get_chunk_token_ids(self, chunk_size: int) -> list[int]:
     return self.prompt_token_ids[start:end]
 ```
 
-### 4.2 这一组方法解决了什么问题
-
-它真正解决的是：
+### 4.2 这组方法解决了什么
 
 1. `Scheduler` 能直接问：这条序列还剩多少 prompt token 没算？
-2. `ModelRunner` 能直接拿到：本轮只该送进模型的那一段 chunk 是什么？
-3. 文档和代码都不再把 `num_cached_tokens` 误解释成“整个序列已经全算过多少 token”。
+2. `ModelRunner` 能直接拿到：本轮该送进模型的那一段 chunk 是什么？
+3. 代码和文档都不再把 `num_cached_tokens` 误读成”整条序列已经全算过多少 token”。
 
 ---
 
 ## 5. 修改 `Config`
 
-为了让 `chunked prefill` 真正可控，建议在 `config.py` 的 `Config` 数据类里增加一个参数：
+在 `config.py` 的 `Config` 数据类里加一个参数：
 
 ```python
 max_prefill_chunk_size: int = 1024
 ```
 
-它的含义是：
+含义：单条序列在一次 prefill step 里最多处理多少未计算 prompt token。
 
-> 单条序列在一次 prefill step 里最多处理多少个未计算 prompt token。
-
-这个参数不应该替代 `max_num_batched_tokens`。两者区别是：
-
-- `max_prefill_chunk_size` 是单条序列每次最多推进多少。
-- `max_num_batched_tokens` 是整个 batch 本轮最多处理多少。
+它和 `max_num_batched_tokens` 是两回事：前者管单条序列每轮推进多少，后者管整个 batch 本轮总量。
 
 ---
 
 ## 6. 修改 `engine/scheduler.py`
 
-### 6.1 调度器必须返回“本轮 prefill 处理多少 token”
+### 6.1 调度器必须告诉 ModelRunner 本轮处理多少 token
 
-如果 `schedule()` 仍然只返回 `list[Sequence]`，`ModelRunner` 就不知道每条 waiting 序列这轮究竟该处理多少 prompt token。
-
-所以推荐把调度结果改成三元组：
+如果 `schedule()` 仍然只返回 `list[Sequence]`，`ModelRunner` 就不知道每条 waiting 序列这轮究竟该处理多少 prompt token。所以把调度结果改成三元组：
 
 ```python
 scheduled_seqs, is_prefill, prefill_chunk_sizes = scheduler.schedule()
 ```
 
-其中：
-
 - `scheduled_seqs`：本轮要处理的序列。
 - `is_prefill`：是否走 prefill 路径。
-- `prefill_chunk_sizes`：仅在 prefill 时使用，表示每条序列这轮该处理多少个 prompt token。
+- `prefill_chunk_sizes`：仅 prefill 时使用，每条序列这轮该处理多少 prompt token。
 
-### 6.2 推荐完整实现
+### 6.2 完整实现
 
-下面是可以直接替换当前 `Scheduler.schedule()` 并新增 `mark_prefill_progress()` 的完整代码块。
+替换当前 `Scheduler.schedule()`，并新增 `mark_prefill_progress()`：
 
 ```python
 from typing import List, Tuple
@@ -355,17 +279,15 @@ def mark_prefill_progress(self, seqs: List[Sequence], chunk_sizes: List[int]) ->
 self.max_prefill_chunk_size = getattr(config, "max_prefill_chunk_size", 1024)
 ```
 
-这一步很小，但很关键。没有它，chunk 大小会变成写死的隐藏常量。
+一行，但少了它 chunk 大小就成了写死的隐藏常量。
 
 ---
 
 ## 7. 修改 `engine/model_runner.py`
 
-### 7.1 `prepare_prefill()` 必须只处理本轮 chunk
+### 7.1 `prepare_prefill()` 只处理本轮 chunk
 
-当前版本会直接把整条 `seq.token_ids` 全部喂进去，这和 chunked prefill 冲突。
-
-下面是可以直接替换 `prepare_prefill()` 的完整方法块。
+当前版本把整条 `seq.token_ids` 全部喂进去，和 chunked prefill 冲突。替换成下面这版：
 
 ```python
 def prepare_prefill(
@@ -428,9 +350,9 @@ def prepare_prefill(
     return input_ids, positions
 ```
 
-### 7.2 `run()` 必须接收 `chunk_sizes`
+### 7.2 `run()` 接收 `chunk_sizes`
 
-下面是可以直接替换 `ModelRunner.run()` 的完整方法块。它假设前面 `04` 已经把 `run_model()` 拆出来，并且 `03` 已经让 sampler 支持 `top_k / top_p`。
+替换 `ModelRunner.run()`。这版假设 Day4 已经把 `run_model()` 拆出来，Day3 已经让 sampler 支持 `top_k / top_p`：
 
 ```python
 @torch.inference_mode()
@@ -480,13 +402,11 @@ def run(
         reset_context()
 ```
 
-### 7.3 这一版最容易看漏的点
+### 7.3 最容易看漏的点：positions
 
-最容易看漏的是 `positions`。
+第二个 chunk 的 positions 绝不能从 0 重新开始。
 
-在 chunked prefill 里，第二个 chunk 的位置绝不能重新从 0 开始。
-
-比如一条 prompt 已经 prefill 了前 512 个 token，本轮再处理下一个 256-token chunk，那么本轮 positions 应该是：
+一条 prompt 已经 prefill 了前 512 个 token，本轮再处理下一个 256-token chunk，positions 应该是：
 
 ```python
 list(range(512, 768))
@@ -498,13 +418,13 @@ list(range(512, 768))
 list(range(256))
 ```
 
-如果这里写错，RoPE 和 KV 写入位置都会一起错。
+写错这里，RoPE 和 KV 写入位置会一起错。
 
 ---
 
 ## 8. 修改 `engine/llm_engine.py`
 
-`LLMEngine.step()` 必须显式传递 chunk 信息。下面是可以直接替换 `step()` 的完整方法块。
+`LLMEngine.step()` 要显式传递 chunk 信息。替换 `step()`：
 
 ```python
 def step(self) -> tuple[list[tuple[int, list[int]]], int]:
@@ -533,30 +453,18 @@ def step(self) -> tuple[list[tuple[int, list[int]]], int]:
     return outputs, num_tokens
 ```
 
-### 8.1 为什么 prefill 后还要走 `postprocess()`
+### 8.1 prefill 后为什么还要走 `postprocess()`
 
-因为当前教学仓库的主线语义是：
+即使这轮只处理了 prompt chunk，模型最后仍然会输出每条序列当前 step 的 logits，sampler 仍然会采出一个”下一 token”。所以这轮结束时两件事不能颠倒：
 
-- 一轮模型执行结束。
-- sampler 选出下一个 token。
-- `postprocess()` 把这个 token append 到序列上。
-
-即使 prefill 这轮只处理了 prompt chunk，它最后仍然会得到每条序列当前 step 的最后 logits，并采样出一个“下一 token”。
-
-所以这一轮结束时，仍然需要：
-
-1. 先记账：本轮 chunk 对应的 prompt token 已经进 cache。
-2. 再 append：本轮真正新生成的 decode token。
-
-这两件事不能颠倒。
+1. 先记账：本轮 chunk 对应的 prompt token 已进 cache（`mark_prefill_progress`）。
+2. 再 append：本轮新生成的 decode token（`postprocess`）。
 
 ---
 
 ## 9. 新增 `tests/test_Day8_chunked_prefill.py`
 
-这一篇的测试目标，不是跑大模型，而是锁住 chunk 账本和调度边界。
-
-下面这份测试脚本可以直接使用：
+测试目标不是跑大模型，而是锁住 chunk 账本和调度边界。下面这份可以直接用：
 
 ```python
 """Day8 chunked prefill 结构测试。"""
@@ -678,7 +586,7 @@ python -m py_compile engine/sequence.py engine/scheduler.py engine/model_runner.
 python tests/test_Day8_chunked_prefill.py
 ```
 
-如果你已经把前面主线 `00~07` 跑通，再做一轮轻量手测：
+如果前面主线 Day0-7 已经跑通，再做一轮轻量手测：
 
 ```bash
 python - <<'PY'
@@ -693,39 +601,35 @@ print("chunk:", seq.get_chunk_token_ids(3))
 PY
 ```
 
-预期输出应表达：
-
-- 还剩 6 个未计算 prompt token。
-- 本轮 chunk 取到索引 4、5、6 对应的 token。
+预期：还剩 6个未计算 prompt token，本轮 chunk 取到索引 4、5、6 对应的 token。
 
 ---
 
 ## 11. 常见坑
 
-1. **调度器切了 chunk，`prepare_prefill()` 却还是把整条 prompt 全送进模型。**
-   这是最常见的“文义上支持 chunk，实际执行仍是全量 prefill”的假实现。
-2. **第二个 chunk 的 positions 又从 0 开始。**
-   这会直接破坏 RoPE 与 cache slot 位置语义。
-3. **把 `num_cached_tokens` 理解成“整条序列都缓存了多少”，而不是“prompt 前缀里已经做完 prefill 的部分”。**
-   这会让 decode 后续账本越来越乱。
-4. **prefill 完成后不把序列从 waiting 转到 running。**
-   这样 decode 永远接不上。
-5. **为了做 chunked prefill，一上来就重写 BlockManager。**
-   这一篇完全没必要。当前教学版只需要先把调度和输入窗口改正确。
+1. **调度器切了 chunk，`prepare_prefill()` 还是把整条 prompt 全送进模型。** 最经典的”文义上支持 chunk，实际仍是全量 prefill”假实现。
+2. **第二个 chunk 的 positions 又从 0 开始。** RoPE 和 cache slot 位置语义一起崩。
+3. **把 `num_cached_tokens` 理解成”整条序列缓存了多少”，而不是”prompt 前缀里做完 prefill 的部分”。** decode 账本会越来越乱。
+4. **prefill 完成后不把序列从 waiting 转到 running。** decode 永远接不上。
+5. **一上来就重写 BlockManager。** 完全没必要。先把调度和输入窗口改正确。
 
 ---
 
-## 12. 本篇结束后你应该明白
+## 12. 读完你应该明白
 
-这一篇最重要的不是记住 `chunked prefill` 这个词。
+chunked prefill 本质上是在改”本轮 token budget 怎么分配”。当前仓库里最自然的接入点是 `Sequence → Scheduler → ModelRunner → LLMEngine.step()`。`positions` 和 `slot_mapping` 必须按 chunk 正确推进，否则就是假实现。
 
-真正要学会的是：
+下一篇：`Day9-Radix-Prefix-Cache与可观测指标.md`——把 hash 表 prefix cache 升级成 prefix tree。
 
-1. `chunked prefill` 本质上是在改“本轮 token budget 怎么分配”。
-2. 当前仓库里，最自然的接入点是 `Sequence -> Scheduler -> ModelRunner -> LLMEngine.step()`。
-3. `positions` 和 `slot_mapping` 必须按 chunk 正确推进，否则就是假实现。
-4. 这一篇先改调度和账本，不急着碰更复杂的 kernel、spec decode 或 MoE。
+---
 
-下一篇进入 radix / prefix-tree cache：
+## 13. 文件级修改清单
 
-- `09-实现Radix-Prefix-Cache与可观测指标.md`
+| 文件 | 要写什么 | 别写什么 |
+|---|---|---|
+| `engine/sequence.py` | 补 `num_uncomputed_tokens / prefill_done / get_chunk_token_ids()` 等 prompt 账本接口 | 别把 `token_ids` 切成多个新请求对象，别把 decode token 算进未 prefill prompt |
+| `config.py` | 新增 `max_prefill_chunk_size`，单条序列每轮 prefill 推进量可配置 | 别用隐藏常量，别让它覆盖 `max_num_batched_tokens` 的 batch 预算含义 |
+| `engine/scheduler.py` | `schedule()` 返回 `prefill_chunk_sizes`，新增 prefill 进度记账接口 | 别继续要求长 prompt 一次性全部上车，别在调度器里跑模型 |
+| `engine/model_runner.py` | `prepare_prefill()` 只准备本轮 chunk，按 `num_cached_tokens` 生成 positions 和 `slot_mapping` | 别把整条 prompt 重新送进模型，别让第二个 chunk 的 positions 从 0 开始 |
+| `engine/llm_engine.py` | `step()` 传递 chunk 信息，prefill 吞吐只统计 `sum(chunk_sizes)` | 别用旧的整段 prefill 统计口径，别颠倒 prefill 记账和 append token 顺序 |
+| `tests/test_Day8_chunked_prefill.py` | 轻量测试：Sequence 账本、scheduler chunk 返回、进度迁移、step token 统计 | 别加载真实模型，别写成 GPU 性能验证 |

@@ -8,7 +8,7 @@ from config import Config
 from sampling_params import SamplingParams
 
 from engine.sequence import Sequence, SequenceStatus
-from utils.context import get_context, set_context, reset_context
+from utils.context import Context, get_context, set_context, reset_context
 import torch
 
 
@@ -112,14 +112,14 @@ def test_context():
     assert ctx.is_prefill == False
     
     # 模拟 Prefill 阶段设置
-    set_context(
+    set_context(Context(
         is_prefill=True,
         cu_seqlens_q=torch.tensor([0, 4, 6, 11], dtype=torch.int32),
         cu_seqlens_k=torch.tensor([0, 4, 6, 11], dtype=torch.int32),
         max_seqlen_q=5,
         max_seqlen_k=5,
         slot_mapping=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
-    )
+    ))
     
     ctx = get_context()
     print(f"Prefill 阶段:")
@@ -129,11 +129,11 @@ def test_context():
     assert ctx.is_prefill == True
     
     # 模拟 Decode 阶段设置
-    set_context(
+    set_context(Context(
         is_prefill=False,
         context_lens=torch.tensor([10, 8, 15]),
         block_tables=torch.tensor([[0, 1], [2, 3], [4, 5]])
-    )
+    ))
     
     ctx = get_context()
     print(f"\nDecode 阶段:")
@@ -157,7 +157,7 @@ def test_config():
     print("测试 Config")
     print("=" * 50)
     
-    config = Config(model="models/Qwen3-0.6B")
+    config = Config(model_path="models/Qwen3-0.6B")
     print(f"模型配置: {config.hf_config}")
     print(f"max_model_len: {config.max_model_len}")
     print(f"kvcache_block_size: {config.kvcache_block_size}")

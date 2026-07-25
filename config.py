@@ -63,4 +63,3 @@ class Config:
     def model(self) -> str:
         """别名"""
         return self.model_path
-

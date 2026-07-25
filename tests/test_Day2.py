@@ -10,6 +10,7 @@ import torch
 from layers.layernorm import RMSNorm
 from layers.activation import SiluAndMul
 from layers.rotary_embedding import RotaryEmbedding, apply_rotary_emb, get_rope
+from utils.context import Context, set_context, reset_context
 
 
 @torch.inference_mode()  # 推理模式：禁用梯度，允许原地操作
@@ -167,10 +168,14 @@ def test_qwen3_model():
     print("=" * 50)
     print("测试 Qwen3 模型")
     print("=" * 50)
-    
+
+    if not torch.cuda.is_available():
+        print("⚠️ 跳过 Qwen3 模型测试（需要 CUDA + FlashAttention）\n")
+        return
+
     from models.qwen3 import Qwen3ForCausalLM
     from dataclasses import dataclass
-    
+
     # 创建一个小型配置用于测试
     @dataclass
     class TestConfig:
@@ -185,32 +190,51 @@ def test_qwen3_model():
         attention_bias: bool = False  # Qwen3 默认 False
         rope_theta: float = 10000.0
         tie_word_embeddings: bool = False
-    
+
     config = TestConfig()
-    model = Qwen3ForCausalLM(config)
+    model = Qwen3ForCausalLM(config).cuda().to(torch.bfloat16)
     model.eval()  # 设置为评估模式
-    
+
     print(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
-    
-    # 测试前向传播
+
+    # 测试前向传播（prefill 模式：一次处理完整序列）
     num_tokens = 10
-    input_ids = torch.randint(0, config.vocab_size, (num_tokens,))
-    
+    input_ids = torch.randint(0, config.vocab_size, (num_tokens,)).cuda()
+
+    # 设置 prefill Context（Attention 层通过全局 Context 获取元数据）
+    set_context(Context(
+        is_prefill=True,
+        cu_seqlens_q=torch.tensor([0, num_tokens], dtype=torch.int32, device='cuda'),
+        cu_seqlens_k=torch.tensor([0, num_tokens], dtype=torch.int32, device='cuda'),
+        max_seqlen_q=num_tokens,
+        max_seqlen_k=num_tokens,
+    ))
+
     logits = model(input_ids)
-    
+    reset_context()
+
     print(f"输入 token 数: {num_tokens}")
     print(f"输出 logits 形状: {logits.shape}")
     assert logits.shape == (num_tokens, config.vocab_size)
-    
-    # 测试自回归生成（简单模拟）
+
+    # 测试自回归生成（简单模拟，每轮 prefill 整个已生成序列）
     print("\n模拟自回归生成:")
     generated = input_ids.tolist()
     for _ in range(3):
-        logits = model(torch.tensor(generated))
+        seq_len = len(generated)
+        set_context(Context(
+            is_prefill=True,
+            cu_seqlens_q=torch.tensor([0, seq_len], dtype=torch.int32, device='cuda'),
+            cu_seqlens_k=torch.tensor([0, seq_len], dtype=torch.int32, device='cuda'),
+            max_seqlen_q=seq_len,
+            max_seqlen_k=seq_len,
+        ))
+        logits = model(torch.tensor(generated, device='cuda'))
+        reset_context()
         next_token = logits[-1].argmax().item()
         generated.append(next_token)
         print(f"  生成 token: {next_token}")
-    
+
     print("✅ Qwen3 模型测试通过!\n")
 
 
@@ -220,32 +244,46 @@ def test_gqa():
     print("=" * 50)
     print("测试 GQA (Grouped Query Attention)")
     print("=" * 50)
-    
+
+    if not torch.cuda.is_available():
+        print("⚠️ 跳过 GQA 测试（需要 CUDA + FlashAttention）\n")
+        return
+
     from models.qwen3 import Qwen3Attention
-    
-    hidden_size = 128
+
+    hidden_size = 256
     num_heads = 8
-    num_kv_heads = 2  # GQA: 每 4 个 Q head 共享 1 个 KV head
-    
+    num_kv_heads = 2  # GQA: 每 4 个 Q head 共享 1 个 KV head（head_dim=32）
+
     attn = Qwen3Attention(
         hidden_size=hidden_size,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         qkv_bias=False,  # Qwen3 默认 False，会使用 QK Norm
-    )
+    ).cuda().to(torch.bfloat16)
     attn.eval()
-    
+
     num_tokens = 5
-    hidden_states = torch.randn(num_tokens, hidden_size)
-    positions = torch.arange(num_tokens)
-    
-    output = attn(positions, hidden_states, attention_mask=None)
-    
+    hidden_states = torch.randn(num_tokens, hidden_size, device='cuda', dtype=torch.bfloat16)
+    positions = torch.arange(num_tokens, device='cuda')
+
+    # 设置 prefill Context（Attention 层走 FlashAttention varlen 路径）
+    set_context(Context(
+        is_prefill=True,
+        cu_seqlens_q=torch.tensor([0, num_tokens], dtype=torch.int32, device='cuda'),
+        cu_seqlens_k=torch.tensor([0, num_tokens], dtype=torch.int32, device='cuda'),
+        max_seqlen_q=num_tokens,
+        max_seqlen_k=num_tokens,
+    ))
+
+    output = attn(positions, hidden_states)
+    reset_context()
+
     print(f"num_heads: {num_heads}, num_kv_heads: {num_kv_heads}")
     print(f"每个 KV head 被 {num_heads // num_kv_heads} 个 Q head 共享")
     print(f"输入形状: {hidden_states.shape}")
     print(f"输出形状: {output.shape}")
-    
+
     assert output.shape == hidden_states.shape
     print("✅ GQA 测试通过!\n")
 

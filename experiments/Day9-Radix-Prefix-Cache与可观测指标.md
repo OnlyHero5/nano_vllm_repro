@@ -1,110 +1,63 @@
-# 09. 实现 Radix Prefix Cache 与可观测指标
+# Day 9 — Radix Prefix Cache：让前缀复用看得见
 
-这一篇继续吸收主线 `00~07` 之外的新能力，但仍然必须站在当前仓库的真实代码边界上。
+当前 `BlockManager` 的 prefix cache 已经能工作：完整块算 hash，hash 命中就复用物理块。但它有两个短板。
 
-这一篇只做三件事：
+第一，**复用路径不透明。** 命中了多少次？复用了多少 token？哪些块是共享的？一问三不知。代码看起来支持 prefix cache，实际可能从来没命中过——没有指标，你根本没法判断。
 
-> 1. 把当前 `BlockManager` 里“完整块 + hash 表”的 prefix cache，升级成“完整块 + radix / prefix tree”的教学版实现。
-> 2. 让 prefix cache 不只会复用，还会暴露命中、复用 token 数、块复用次数等可观测指标。
-> 3. 保持它与当前 `Sequence / Scheduler / ModelRunner / Attention` 边界兼容。
+第二，**hash 表是扁平的。** 它只知道”这个 hash 出现过”，不知道”这个前缀下面还能接哪些块”。前缀共享的树形结构被压成了一张平面表。
 
-这一篇不做下面这些事：
-
-- 不引入新的 KV cache tensor 布局。
-- 不改 `layers/attention.py` 的 Triton store kernel。
-- 不把 prefix cache 扩展成跨进程共享服务。
-- 不引入 speculative decoding。
-- 不引入 offload。
-
-原因很简单：
-
-> 当前仓库最值得升级的，是“前缀复用的数据结构和观测能力”，而不是先把整条执行图推倒重来。
+这次做两件事：在 hash 之上叠一棵 prefix tree，把前缀共享结构显式化；同时加上命中/复用指标，让 prefix cache 的效果可观测。KV cache tensor 布局、Triton kernel、attention 协议都不碰。
 
 ---
 
-## 1. 为什么从 hash prefix cache 升级到 radix prefix cache
+## 1. 当前 hash prefix cache 的两个限制
 
-当前 `engine/block_manager.py` 的 prefix cache 已经能工作。它的核心思路是：
+`engine/block_manager.py` 里的 prefix cache 思路是：只有完整块才算 hash，hash 链入 `prefix_hash` 保证”相同前缀 + 相同内容”才命中，命中后复用整个物理块。
 
-1. 只有完整块才计算 hash。
-2. hash 里链入 `prefix_hash`，保证“相同前缀 + 相同当前块内容”才命中。
-3. 命中后复用整个物理块。
+比没有 prefix cache 强很多，但：
 
-这已经比“没有 prefix cache”强很多，但有两个限制。
+### 1.1 只能按完整块边界命中
 
-### 1.1 它只能按完整块边界命中
+两条序列的长前缀高度重合，但尾部重合不够一个完整 block——hash 表无法表达”部分尾块复用”。这次先不做 partial-tail 复用，但把前缀结构显式化，为后续扩展留边界。
 
-两条序列的长前缀可能高度重合，但如果尾部重合不够一个完整 block，当前 hash 表无法表达“部分尾块复用”。这一篇先不做 partial-tail 复用，但会把前缀结构显式化，为后续扩展留出边界。
+### 1.2 复用路径不透明
 
-### 1.2 它的复用路径不透明
+命中逻辑能工作，但你回答不了这些问题：命中了多少次？复用了多少 token？哪些块是共享的？cache 的前缀覆盖长什么样？
 
-当前命中逻辑能工作，但很难回答：
-
-- 命中了多少次 prefix cache？
-- 一共复用了多少 token？
-- 哪些块是通过 prefix 命中的？
-- 当前 cache 的树形前缀覆盖情况大概是什么样？
-
-radix / prefix-tree 方案的价值就在这里：
-
-> 它不只是一个“能不能命中”的映射表，而是一种能表达“前缀共享结构”的数据结构。
+prefix tree 的价值就在这里：它不只是”能不能命中”的映射表，而是能表达”前缀共享结构”的数据结构。
 
 ---
 
-## 2. 当前代码是什么状态
+## 2. 当前代码的三个相关点
 
-与 prefix cache 直接相关的地方主要有：
-
-1. `engine/block_manager.py`
-2. `engine/sequence.py`
-3. `engine/scheduler.py`
-4. `plans/02A-讲透PagedAttention、BlockManager与调度主线.md`
-
-### 2.1 当前 `BlockManager` 里只有 `hash_to_block_id`
-
-当前结构是：
+### 2.1 `BlockManager` 里只有 `hash_to_block_id`
 
 ```python
 self.hash_to_block_id: dict[int, int] = {}
 ```
 
-它适合做“这个完整块 hash 有没有出现过”，但不适合表达：
+适合回答”这个完整块 hash 有没有出现过”，但表达不了：某个前缀下面还能接哪些块、前缀树的深度和分支、一条序列沿着哪条共享路径匹配上。
 
-- 某个前缀下面还能继续接哪些块。
-- 当前前缀树的深度和分支情况。
-- 一条序列沿着哪条共享前缀路径匹配上。
+### 2.2 `Sequence` 已经有 `num_cached_tokens`
 
-### 2.2 当前 `Sequence` 已经有 `num_cached_tokens`
+后面继续用它做”这条序列复用了多少前缀 token”的总账本。
 
-这很好，因为后面仍然可以继续用 `seq.num_cached_tokens` 作为“这条序列已经复用了多少前缀 token”的总账本。
+### 2.3 没有显式的 observability 对象
 
-### 2.3 当前系统还没有显式 observability 对象
-
-所以需要一个轻量结构，专门统计：
-
-- prefix cache hit 次数。
-- miss 次数。
-- reused blocks。
-- reused tokens。
-
-没有指标很容易产生错觉：代码看起来支持 prefix cache，但实际从来没命中过。
+需要一个轻量结构统计 hit/miss/reused blocks/reused tokens。没有指标很容易产生错觉：代码看起来支持 prefix cache，实际从来没命中过。
 
 ---
 
-## 3. 本篇目标边界
+## 3. 这次要搭的结构
 
-当前仓库最稳妥的目标，是实现下面这套结构：
-
-1. 块级 hash 仍然保留。
-2. 在 hash 之上新增一棵 prefix tree。
-3. 每个树节点代表“一个已经稳定的完整块”。
-4. 父子关系代表“某个块在某个前缀之后继续延伸”。
-5. 复用时优先沿着树和 hash 索引找稳定完整块。
+1. 块级 hash 保留。
+2. 在 hash 之上叠一棵 prefix tree。
+3. 每个树节点代表一个已填满、已算出 hash 的完整块。
+4. 父子关系代表”某个块在某个前缀之后继续延伸”。
+5. 复用时沿树 + hash 索引找稳定完整块。
 6. 同时统计 prefix cache 观测指标。
 
-换句话说：
-
-> 这一篇做的是“块级 hash prefix cache 的结构升级版”，不是“任意 token 级压缩树”。
+一句话：块级 hash prefix cache 的结构升级版，不是任意 token 级压缩树。
 
 ---
 
@@ -112,7 +65,7 @@ self.hash_to_block_id: dict[int, int] = {}
 
 ### 4.1 新增 prefix tree 和指标结构
 
-先在 `engine/block_manager.py` 顶部增加两个轻量数据类。
+在 `engine/block_manager.py` 顶部加两个轻量数据类：
 
 ```python
 from dataclasses import dataclass, field
@@ -160,9 +113,9 @@ class PrefixTreeNode:
         return self.block_id is None
 ```
 
-### 4.2 在 `BlockManager.__init__()` 中接入新结构
+### 4.2 在 `BlockManager.__init__()` 中接入
 
-把初始化逻辑里的 prefix cache 相关字段改成下面这样。
+把 prefix cache 相关字段改成：
 
 ```python
 # root 节点不对应任何真实 block。
@@ -250,7 +203,7 @@ def _lookup_prefix_block(
 
 ### 4.5 替换 `allocate()`
 
-下面给出完整教学版实现。
+完整教学版实现：
 
 ```python
 def allocate(self, seq: Sequence):
@@ -299,7 +252,7 @@ def allocate(self, seq: Sequence):
 
 ### 4.6 替换 `append_slot()`
 
-chunked prefill、decode 以及后续新生成 token 都可能让“原本不完整的末尾块”在某一刻刚好填满。`append_slot()` 在“当前块刚好填满”时，也必须把它挂进 prefix tree。
+decode 或 chunked prefill 可能让末尾块在某一刻刚好填满。`append_slot()` 在”当前块刚好填满”时也要把它挂进 prefix tree：
 
 ```python
 def append_slot(self, seq: Sequence):
@@ -358,26 +311,20 @@ def reset_prefix_cache_stats(self) -> None:
 
 ## 5. 为什么这一版仍然与当前仓库兼容
 
-这一版看起来变化很大，但它故意没有碰下面这些稳定边界：
+看起来变化不小，但故意没碰这些稳定边界：
 
-1. `Sequence.block_table` 仍然是“逻辑块 -> 物理块”的映射。
+1. `Sequence.block_table` 仍然是”逻辑块 → 物理块”的映射。
 2. `slot_mapping` 的计算方式不变。
-3. `Attention` 仍然只关心真实 `slot_mapping` 和 `kv_cache`。
-4. `Scheduler` 仍然只和“能不能 allocate / can_append / deallocate”打交道。
+3. `Attention` 仍然只关心 `slot_mapping` 和 `kv_cache`。
+4. `Scheduler` 仍然只和 `allocate / can_append / deallocate` 打交道。
 
-也就是说：
-
-> 这一篇改的是 prefix cache 的“命中结构”和“观测能力”，不是把整个 PagedAttention 主线推翻重来。
+改的是 prefix cache 的命中结构和观测能力，不是推翻 PagedAttention主线。
 
 ---
 
 ## 6. 新增 `tests/test_Day9_radix_cache.py`
 
-这份测试不跑大模型，专门锁住三类边界：
-
-1. prefix tree 节点会被正确登记。
-2. 同前缀完整块会命中复用。
-3. 指标会正确增长。
+不跑大模型，专门锁住三类边界：prefix tree 节点正确登记、同前缀完整块命中复用、指标正确增长。
 
 ```python
 """Day9 radix prefix cache 结构测试。"""
@@ -456,7 +403,7 @@ python -m py_compile engine/block_manager.py tests/test_Day9_radix_cache.py
 python tests/test_Day9_radix_cache.py
 ```
 
-如果你想做一轮轻量手测，可以再跑：
+轻量手测：
 
 ```bash
 python - <<'PY'
@@ -480,39 +427,33 @@ print("stats:", manager.get_prefix_cache_stats())
 PY
 ```
 
-如果实现正确，你应该能看到：
-
-- `seq1` 和 `seq2` 的第一块映射到同一个物理块。
-- `stats` 里 `hit_count`、`reused_blocks`、`reused_tokens` 都大于 0。
+实现正确的话：`seq1` 和 `seq2` 的第一块映射到同一个物理块，`stats` 里 `hit_count`、`reused_blocks`、`reused_tokens` 都大于 0。
 
 ---
 
 ## 8. 常见坑
 
-1. **把 radix tree 理解成“任意 token 级压缩 trie”，然后试图重写整个 KV cache 地址体系。**
-   这一篇完全不需要走那么远。当前教学版只需要做完整块级前缀树。
-2. **删除 hash 检查，只保留 tree。**
-   这样会让快速命中索引能力变差。教学版最稳妥的是“tree 表达结构，hash 做快速索引”。
-3. **最后一个不完整块也注册进 prefix cache。**
-   这样很容易把不稳定尾块错误复用出去。
-4. **只做复用，不做观测指标。**
-   这会让你根本不知道 prefix cache 到底有没有起作用。
-5. **把 prefix tree 节点直接塞进 `Sequence` 里长期保存。**
-   当前教学仓库没必要让序列持有这么重的状态；统计和复用逻辑都放在 `BlockManager` 更稳。
+1. **把 radix tree 理解成”任意 token 级压缩 trie”，试图重写整个 KV cache 地址体系。** 完全不需要。当前只做完整块级前缀树。
+2. **删掉 hash 检查，只留 tree。** 快速命中索引能力会变差。最稳的是”tree 表达结构，hash 做快速索引”。
+3. **最后一个不完整块也注册进 prefix cache。** 不稳定尾块会被错误复用。
+4. **只做复用，不做观测指标。** 你根本不知道 prefix cache 到底有没有起作用。
+5. **把 prefix tree 节点塞进 `Sequence` 里长期保存。** 没必要让序列持有这么重的状态；统计和复用逻辑都放 `BlockManager`。
 
 ---
 
-## 9. 本篇结束后你应该明白
+## 9. 读完你应该明白
 
-这一篇最重要的不是“会写一个树节点类”。
+prefix cache 的升级重点不只是”再快一点”，而是”更准确地表达前缀共享结构”。当前仓库最适合的路径是在现有 block/hash 体系上叠 prefix tree，不是改 KV cache tensor 布局。observability 不是附属品——没有指标，你判断不了 prefix cache 是否真的有价值。
 
-真正要学会的是：
+做完这一步，后面的 speculative decoding、MoE、offload 才更容易建立在”看得见账本”的推理系统上。
 
-1. prefix cache 的升级重点，不只是“再快一点”，而是“更准确地表达前缀共享结构”。
-2. 当前仓库最适合的升级路径，是在现有 block / hash 体系上叠加 prefix tree，而不是改 KV cache tensor 布局。
-3. observability 不是附属品，而是判断 prefix cache 是否真的有价值的必要条件。
-4. 这一步做完以后，后面的 speculative decoding、MoE 和 offload 才更容易建立在“看得见账本”的推理系统上。
+下一篇：`Day10-Speculative-Decoding基础版.md`。
 
-下一篇进入 speculative decoding：
+---
 
-- `10-实现Speculative-Decoding基础版.md`
+## 10. 文件级修改清单
+
+| 文件 | 要写什么 | 别写什么 |
+|---|---|---|
+| `engine/block_manager.py` | 新增 `PrefixCacheStats`、`PrefixTreeNode`、tree 注册/lookup、指标导出，完整块复用继续服务 `Sequence.block_table` | 别改 KV cache tensor 布局，别把不完整尾块注册成可复用前缀 |
+| `tests/test_Day9_radix_cache.py` | 轻量测试：stats 导出、完整块注册、同前缀命中复用、不完整尾块边界 | 别跑大模型，别写依赖具体 hash 数值的脆弱断言 |

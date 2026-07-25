@@ -1,127 +1,57 @@
-# 10. 实现 Speculative Decoding 基础版
+# Day 10 — Speculative Decoding：让小模型先猜，大模型来验
 
-这一篇开始吸收 2026 年前后 nano-vllm 生态里很重要的一条能力线：`speculative decoding`。
+主线 Day0-7 解决的是”怎么把一个模型高效跑起来”。但它默认每轮 decode 只由主模型自己预测一个 token。
 
-这一篇只做一版**教学版、最小可运行、与当前仓库接口兼容**的 speculative decoding。
+speculative decoding 打破这个默认：
 
-目标是：
-
-> 在不改动 Attention、KV Cache tensor 布局和 Scheduler 主状态机的前提下，让当前仓库支持“一主一草稿”双模型协作生成。
-
-这一篇只做下面四件事：
-
-1. 增加一个轻量 `DraftModelRunner`，让草稿模型能批量提议多个 token。
-2. 让主模型一次验证一段 draft token，而不是只验证 1 个 token。
-3. 增加 accept / reject 逻辑，把 speculative decoding 写成清楚的执行边界。
-4. 新增教学版测试脚本，验证“接受 / 拒绝 / 回退”语义。
-
-这一篇不做下面这些事：
-
-- 不引入 Medusa / 多头 speculative decoding。
-- 不引入 tree-based verifier。
-- 不和 Tensor Parallel / CUDA Graph 联动优化。
-- 不让草稿模型和主模型共享 KV cache。
-- 不直接接入 MoE 或 FP8 路径。
-
-原因很简单：
-
-> 当前仓库最稳定的边界，是 `Scheduler -> ModelRunner -> Sampler -> postprocess` 这一条单模型链路。教学版 speculative decoding 应该以“在这条链路外面包一层 draft-verify 逻辑”为主，而不是一上来就重写底层 Attention 或 KV Cache 协议。
-
----
-
-## 1. 为什么 speculative decoding 值得单独成篇
-
-主线 `00~07` 解决的是：
-
-- 怎么把一个模型高效跑起来。
-- 怎么做 continuous batching。
-- 怎么做 prefix cache。
-- 怎么做 TP、CUDA Graph。
-
-但它默认还是：
-
-> 每轮 decode 只由主模型自己预测一个下一个 token。
-
-`speculative decoding` 的核心变化是：
-
-1. 先让一个更便宜的 draft 模型一次猜多个 token。
+1. 先让一个更便宜的 draft 模型一次猜 `k` 个 token。
 2. 再让主模型一次验证这串 draft token。
-3. 能接受的尽量整段接受，不能接受的就回退到主模型真实输出。
+3. 能接受的整段接受，不能接受的回退到主模型真实输出。
 
-这条思路的价值在于：
+主模型很贵、草稿模型便宜时，这能显著减少主模型的单 token decode次数。对长生成来说，吞吐提升往往很明显。
 
-- 当主模型很贵、草稿模型更便宜时，能够显著减少主模型单 token decode 次数。
-- 对长生成来说，吞吐提升往往很明显。
-
-但当前仓库如果直接把 speculative decoding 硬塞进 `Sampler` 或 `Attention`，会很快失控。
-
-所以这篇的关键思想是：
-
-> speculative decoding 是一层新的生成控制流，不是一层新的底层 attention kernel。
+关键认知：**speculative decoding 是一层新的生成控制流，不是新的 attention kernel。** 所以这次不碰 Attention、KV Cache 布局和 Scheduler 状态机——在 `Scheduler → ModelRunner → Sampler → postprocess` 这条链路外面包一层 draft-verify 逻辑就够了。Medusa、tree-based verifier、TP/CUDA Graph 联动、draft-target 共享 KV cache——都不做。
 
 ---
 
-## 2. 当前代码是什么状态
+## 1. 一轮 speculative decode 长什么样
 
-当前与 speculative decoding 最相关的地方有：
-
-1. `engine/model_runner.py`
-2. `engine/llm_engine.py`
-3. `layers/sampler.py`
-4. `engine/sequence.py`
-
-### 2.1 当前 `ModelRunner.run()` 只会返回“每条序列一个 next token”
-
-这非常适合普通 decode，但不适合 speculative decoding。
-
-因为 speculative decoding 的主模型验证阶段，需要一次处理：
-
-- 当前上下文。
-- 加上一段草稿 token。
-
-然后得到这一整段位置上的 logits。
-
-### 2.2 当前 `Sampler` 只负责“从 logits 里采样下一个 token”
-
-这很好，因为它的职责很纯。
-
-这篇不建议把 speculative decoding 的接受 / 拒绝逻辑塞进 `Sampler`。
-
-更稳妥的方式是：
-
-- `Sampler` 继续做单步采样。
-- speculative 的比较逻辑放在更上层的 verifier 中。
-
-### 2.3 当前 `Sequence` 已经足够表达“追加 token”
-
-教学版 speculative decoding 不需要重写 `Sequence` 主结构。它只需要在当前 step 内把“最终接受的 token 列表”逐个追加回 `Sequence`。
-
----
-
-## 3. 教学版 speculative decoding 的边界
-
-这一篇采用最容易讲清楚、也最贴近当前仓库的版本。
-
-### 3.1 两个模型，两个角色
-
-- **target model**：当前仓库已有主模型，结果以它为准。
-- **draft model**：更小、更便宜，只负责提议 token。
-
-### 3.2 一轮 speculative decode 的流程
-
-对于每条 running 序列：
+对每条 running 序列：
 
 1. draft model 基于当前上下文，连续提议 `k` 个 token。
-2. target model 一次性验证这 `k` 个 token 对应的位置。
-3. 从左到右比较：如果某个位置 draft token 与 target token 一致，就接受；一旦第一次不一致，就停止继续接受。
-4. 如果全都接受，还要再补一个由 target model 决定的真实下一个 token。
-5. 如果中间出现拒绝，则把前面已接受的 token 保留，再把第一个拒绝位置改成 target token。
+2. target model 一次性验证这 `k` 个位置。
+3. 从左到右比较：draft token 与 target token 一致就接受；第一次不一致就停。
+4. 全部接受？再补一个 target model 决定的真实 next token。
+5. 中间拒绝？保留已接受的前缀，把第一个拒绝位置改成 target token。
+
+---
+
+## 2. 当前代码的三个相关点
+
+### 2.1 `ModelRunner.run()` 只返回”每条序列一个 next token”
+
+普通 decode 够用，但 speculative 的验证阶段需要一次处理”当前上下文 + 一段草稿 token”，得到整段位置上的 logits。
+
+### 2.2 `Sampler` 职责很纯：从 logits 采样
+
+别把 accept/reject 塞进 `Sampler`。它继续做单步采样，speculative 的比较逻辑放在更上层的 verifier。
+
+### 2.3 `Sequence` 已经够用
+
+不需要重写。教学版只需要在当前 step 内把”最终接受的 token 列表”逐个追加回 `Sequence`。
+
+---
+
+## 3. 两个模型，两个角色
+
+- **target model**：当前仓库已有的主模型，结果以它为准。
+- **draft model**：更小、更便宜，只负责提议 token。
 
 ---
 
 ## 4. 修改 `config.py`
 
-先在 `Config` 里加一组显式开关，让这条路径不会默默影响现有主线。
+在 `Config` 里加一组显式开关，让这条路径不会默默影响主线：
 
 ```python
 # ===== speculative decoding =====
@@ -130,7 +60,7 @@ draft_model_path: str | None = None
 speculative_k: int = 4
 ```
 
-然后在 `__post_init__()` 中增加校验：
+在 `__post_init__()` 里加校验：
 
 ```python
 if self.enable_speculative_decoding:
@@ -139,29 +69,13 @@ if self.enable_speculative_decoding:
     assert self.speculative_k > 0, "speculative_k 必须 > 0"
 ```
 
-### 4.1 为什么不用更复杂的 speculative 配置对象
-
-因为当前仓库还没有：
-
-- 在线 serving config 系统。
-- 多模型 worker pool。
-- API 级 feature flags。
-
-所以教学版最稳妥的方案是：只在 `Config` 里把 speculative decoding 的主开关、草稿模型路径和 `k` 暴露清楚。
+当前仓库没有在线 serving config 系统、多模型 worker pool、API 级 feature flags，所以教学版只在 `Config` 里把主开关、草稿路径和 `k` 暴露清楚就够了。
 
 ---
 
 ## 5. 新增 `engine/speculative.py`
 
-这篇不建议把所有 speculative 逻辑都塞进 `LLMEngine` 或 `ModelRunner`。
-
-更清楚的边界是新建一个文件，专门负责：
-
-- draft 提议。
-- target 验证。
-- accept / reject 计算。
-
-下面给出完整文件内容，代码块可以直接写成新的 `engine/speculative.py`。
+别把所有 speculative 逻辑塞进 `LLMEngine` 或 `ModelRunner`。新建一个文件，专门负责 draft 提议、target 验证、accept/reject 计算。下面这份可以直接写成 `engine/speculative.py`：
 
 ```python
 """教学版 speculative decoding。
@@ -271,14 +185,7 @@ class SpeculativeVerifier:
 
 ## 6. 修改 `engine/model_runner.py`
 
-当前 `ModelRunner` 已经有：
-
-- `prepare_prefill()`
-- `prepare_decode()`
-- `run_model()`
-- `run()`
-
-这一篇只新增一个“目标模型验证一段 token”的接口。下面是可直接加入 `ModelRunner` 类内部的完整方法块。
+当前 `ModelRunner` 已经有 `prepare_prefill()`、`prepare_decode()`、`run_model()`、`run()`。这次只新增一个”目标模型验证一段 token”的接口，加入 `ModelRunner` 类内部：
 
 ```python
 @torch.inference_mode()
@@ -345,27 +252,17 @@ def verify_token_sequence(self, prefix_token_ids: list[int], draft_tokens: list[
         reset_context()
 ```
 
-### 6.1 这里为什么是 greedy verify
+### 6.1 为什么 verify 用 greedy
 
-教学版 verifier 用 `temperature=0`，也就是 greedy。原因是：
-
-- target model 的验证阶段，本质上是在判断“它自己真正愿意走哪条 token 路径”。
-- 如果这里再引入随机采样，accept / reject 语义就会变得不稳定。
-
-所以教学版最稳的设定是：
-
-> draft 可以是采样，verify 必须是 target model 的确定性判断。
+target model 的验证阶段，本质上是在判断”它自己真正愿意走哪条 token 路径”。如果这里引入随机采样，accept/reject 语义就不稳定了。所以：**draft 可以是采样，verify 必须是确定性判断。**
 
 ---
 
 ## 7. 修改 `engine/llm_engine.py`
 
-这篇不建议把 speculative 逻辑塞进 `Scheduler`。更稳的方式是：
+别把 speculative 逻辑塞进 `Scheduler`。Scheduler 继续只管"这一轮处理谁"，`LLMEngine.step()` 在 decode 分支里决定走普通 decode 还是 speculative decode。
 
-- Scheduler 继续只决定这一轮 decode 处理哪些序列。
-- `LLMEngine.step()` 在 decode 分支里决定走普通 decode 还是 speculative decode。
-
-下面给出需要新增到 `LLMEngine` 类里的两个方法块，以及 `step()` 的 decode 分支修改。
+新增两个方法到 `LLMEngine`，再改 `step()` 的 decode 分支：
 
 ```python
 def _run_speculative_decode(self, seqs: list[Sequence]) -> list[list[int]]:
@@ -421,7 +318,7 @@ return outputs, -len(seqs)
 
 ## 8. 新增 `tests/test_Day10_speculative.py`
 
-这份测试不加载真实模型，专门锁 speculative 的接受 / 拒绝语义。
+不加载真实模型，专门锁 accept/reject 语义：
 
 ```python
 """Day10 speculative decoding 结构测试。"""
@@ -486,7 +383,7 @@ python -m py_compile config.py engine/speculative.py engine/model_runner.py engi
 python tests/test_Day10_speculative.py
 ```
 
-如果只想快速看 `accept / reject` 语义，还可以手动跑一段：
+快速看 accept/reject 语义：
 
 ```bash
 python - <<'PY'
@@ -509,30 +406,28 @@ PY
 
 ## 10. 常见坑
 
-1. **把 speculative decoding 塞进 `Sampler`。**
-   `Sampler` 只负责从 logits 里选 token；accept / reject 是更高层的生成控制流。
-2. **让 verifier 也走随机采样。**
-   这样 `accept / reject` 语义会变得不稳定。
-3. **试图让 draft model 和 target model 立即共享 KV cache。**
-   这会把当前教学仓库的边界复杂度一下抬得太高。
-4. **在 `Scheduler` 里直接重写 speculative 逻辑。**
-   当前教学版最清楚的方式，是让 `Scheduler` 继续管“这一轮处理谁”，把 speculative 的额外控制流放在 `LLMEngine` 外层。
-5. **以为 speculative decoding 的重点是“多采样几个 token”。**
-   真正的重点是草稿提议、target 验证、正确的接受 / 拒绝回退语义。
+1. **把 speculative decoding 塞进 `Sampler`。** `Sampler` 只管从 logits 选 token；accept/reject 是更高层的生成控制流。
+2. **让 verifier 走随机采样。** accept/reject 语义会不稳定。
+3. **让 draft 和 target 立即共享 KV cache。** 边界复杂度一下抬太高。
+4. **在 `Scheduler` 里重写 speculative 逻辑。** Scheduler 继续管”这一轮处理谁”，speculative 的额外控制流放 `LLMEngine` 外层。
+5. **以为重点是”多采样几个 token”。** 真正的重点是草稿提议、target 验证、正确的接受/拒绝回退语义。
 
 ---
 
-## 11. 本篇结束后你应该明白
+## 11. 读完你应该明白
 
-这一篇最重要的不是记住某个函数名。
+speculative decoding 是一条新的生成控制流，不是新的 attention kernel。教学版最稳的接入点是 `DraftModelRunner + SpeculativeVerifier + LLMEngine.decode 分支`。verifier 的职责是判断 draft token 是否和 target model 的真实偏好一致。先把 accept/reject 语义写对，再想性能优化。
 
-真正要学会的是：
+下一篇：`Day11-MoE推理主线与专家并行认知篇.md`。
 
-1. speculative decoding 是一条新的生成控制流，不是新的 attention kernel。
-2. 教学版最稳的接入点，是 `DraftModelRunner + SpeculativeVerifier + LLMEngine.decode 分支`。
-3. verifier 的职责是判断 draft token 是否和 target model 的真实偏好一致。
-4. 先把 accept / reject 语义写对，再去想更激进的性能优化。
+---
 
-下一篇进入 MoE：
+## 12. 文件级修改清单
 
-- `11-实现MoE推理主线与专家并行认知篇.md`
+| 文件 | 要写什么 | 别写什么 |
+|---|---|---|
+| `config.py` | 新增 `enable_speculative_decoding / draft_model_path / speculative_k` 显式开关和校验 | 别让 speculative decoding 默默改变默认单模型路径 |
+| `engine/speculative.py` | 新增 `DraftModelRunner`、`SpeculativeVerifier`、`SpeculativeResult`，只管 draft/verify/accept-reject 控制流 | 别在这里改 Attention、KV Cache 布局或 Scheduler 状态机 |
+| `engine/model_runner.py` | 补草稿单步提议和 target 批量验证的最小接口，复用现有前向/logits/sampler 边界 | 别让 verifier 走随机采样，别让 draft/target 立即共享 KV cache |
+| `engine/llm_engine.py` | decode 分支按配置选择普通 decode 或 speculative decode，接受的多个 token 逐个交给 postprocess | 别把 speculative 塞进 Scheduler，别绕过 EOS/max_tokens 检查 |
+| `tests/test_Day10_speculative.py` | 不加载模型的语义测试：全接受、首 token 拒绝、前缀接受后拒绝 | 别依赖真实草稿模型，别把性能提升当单元测试断言 |
