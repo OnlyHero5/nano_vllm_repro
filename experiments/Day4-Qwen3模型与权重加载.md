@@ -247,22 +247,13 @@ def compute_logits(self, hidden_states):
 
 这意味着 ModelRunner 依赖 forward 返回 logits。改了 forward 后，ModelRunner 也要改——但那是 Day5 的事。
 
-### 问题 3：旧注释代码未清理
+### 顺带清理两处
 
-`Qwen3Attention.forward()` 中有大量被注释掉的手写 attention 代码（约 30 行），影响阅读。真实路径只有 `self.attn(q, k, v)` 一条。
+这两处不涉及设计，下面的完整代码里已经改好，读到时不必停：
 
-### 问题 4：`from_pretrained` 参数名笔误
-
-当前代码：
-```python
-# 当前（第 380 行）
-def from_pretrained(cls, mode_path: str):
-
-# 正确应为
-def from_pretrained(cls, model_path: str):
-```
-
-`mode_path` 应为 `model_path`。虽然当前 `from_pretrained` 只创建模型结构不加载权重，但参数名错误会导致调用时困惑（`model` 里是模型路径，不是 "mode"）。
+- `Qwen3Attention.forward()` 里有约 30 行被注释掉的手写 attention 代码。真实路径只有
+  `self.attn(q, k, v)` 一条，那 30 行只会让人怀疑自己看漏了什么，删掉。
+- `from_pretrained(cls, mode_path)` 的参数名少个字母，应为 `model_path`。
 
 ---
 

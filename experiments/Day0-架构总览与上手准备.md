@@ -244,18 +244,20 @@ nano-vLLM 用了一个更轻量的方案：
 | 对外接口 | `llm.py` | 结实 |
 | 推理脚本 | `example.py` | 结实，可运行 |
 
-### 主线要补的八处（Day1-Day6 逐个动手）
+### 主线要补的十处（Day1-Day6 逐个动手）
 
-八处里没有一处是"随手改改"——每一处背后都有一个值得想清楚的设计问题，正文会连着问题一起讲：
+这十处没有一处是"随手改改"——每一处背后都有一个值得想清楚的设计问题，正文会连着问题一起讲：
 
-1. **Config 缺少 property**：下游代码散落着 `getattr(hf_config, ...)`，配置读取没有单一出口
-2. **SamplingParams 不支持 top_k/top_p**：采样策略被锁在 temperature 一个旋钮上
-3. **Linear 的 weight_loader 缺乏 dtype/device 对齐**：safetensors 是 fp32、模型是 bf16 时会静默出错
-4. **Qwen3ForCausalLM.forward() 直接返回 logits**：挡住了后面的 CUDA Graph 捕获
-5. **ModelRunner.run() 没有 reset_context()**：全局 Context 会在 step 之间泄漏
-6. **LLMEngine.step() 的 prefill token 统计**：把命中缓存的 prefix token 也算成了新算的
+1. **Config 缺少 property**：下游代码散落着 `getattr(hf_config, ...)`，配置读取没有单一出口（Day1 §3）
+2. **SamplingParams 不支持 top_k/top_p**：采样策略被锁在 temperature 一个旋钮上（Day1 §3）
+3. **SamplingParams 不允许 temperature=0**：而 temperature=0 正是 greedy 解码，现在只能拿 1e-4 这种极小值糊过去（Day1 §3）
+4. **Sequence 没有透传 top_k/top_p**：参数补齐后，还得让它真的流到采样器（Day1 §3）
+5. **`context.py` 的类型注解**：`max_context_len: int = None` 应为 `int | None = None`（Day1 §3）
+6. **Linear 的 weight_loader 缺乏 dtype/device 对齐**：safetensors 是 fp32、模型是 bf16 时会静默出错（Day2 §2.4）
 7. **`block_manager.py` 的 Off-by-One**：Prefix Cache 链式哈希条件 `len(block_table) > 2` 应为 `>= 2`——一个字符的差别，让哈希链丢掉第一个 block（Day3 §3）
-8. **`context.py` 的类型注解**：`max_context_len: int = None` 应为 `int | None = None`（Day1 §3）
+8. **Qwen3ForCausalLM.forward() 直接返回 logits**：挡住了后面的 CUDA Graph 捕获（Day4 §3）
+9. **ModelRunner.run() 没有 reset_context()**：全局 Context 会在 step 之间泄漏（Day5 §4.2）
+10. **LLMEngine.step() 的 prefill token 统计**：把命中缓存的 prefix token 也算成了新算的（Day6 §3）
 
 ### 进阶扩展（Day7 会涉及）
 
