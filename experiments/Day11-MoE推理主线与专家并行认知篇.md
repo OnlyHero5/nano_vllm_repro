@@ -402,10 +402,10 @@ for weight_name in f.keys():
 
 | HF 权重名 | 子串命中 | 重写后参数名 | 在我们模型里存在吗 |
 |---|---|---|---|
-| `model.layers.N.mlp.experts.E.gate_proj.weight` | `gate_proj` | `model.layers.N.mlp.experts.E.gate_up_proj.weight` | ✅ 存在（`MoEExpert.gate_up_proj`） |
-| `model.layers.N.mlp.experts.E.up_proj.weight` | `up_proj` | `model.layers.N.mlp.experts.E.gate_up_proj.weight` | ✅ 存在（同上，`shard_id=1`） |
-| `model.layers.N.mlp.experts.E.down_proj.weight` | （无） | `model.layers.N.mlp.experts.E.down_proj.weight` | ✅ 存在（`MoEExpert.down_proj.weight`），走 `is_packed=False` 分支 |
-| `model.layers.N.mlp.gate.weight`（router） | （无） | `model.layers.N.mlp.gate.weight` | ❌ 不存在！我们的对应参数叫 `model.layers.N.mlp.router.gate.weight` |
+| `model.layers.N.mlp.experts.E.gate_proj.weight` | `gate_proj` | `model.layers.N.mlp.experts.E.gate_up_proj.weight` | 存在（`MoEExpert.gate_up_proj`） |
+| `model.layers.N.mlp.experts.E.up_proj.weight` | `up_proj` | `model.layers.N.mlp.experts.E.gate_up_proj.weight` | 存在（同上，`shard_id=1`） |
+| `model.layers.N.mlp.experts.E.down_proj.weight` | （无） | `model.layers.N.mlp.experts.E.down_proj.weight` | 存在（`MoEExpert.down_proj.weight`），走 `is_packed=False` 分支 |
+| `model.layers.N.mlp.gate.weight`（router） | （无） | `model.layers.N.mlp.gate.weight` | 不存在！我们的对应参数叫 `model.layers.N.mlp.router.gate.weight` |
 
 **结论：唯一硬伤是 router 的命名不匹配。**
 
@@ -687,7 +687,7 @@ if __name__ == "__main__":
 
 从 `nano_vll_repro/` 运行：
 
-先跑计划要求的最小 MoE smoke 命令：
+先跑最小 MoE smoke 命令：
 
 ```bash
 python -m py_compile models/qwen3.py tests/test_Day11_moe.py
@@ -763,6 +763,6 @@ Qwen3DecoderLayer
 接下来两条可选路径：
 
 - **MoE 真上单卡**：`Day11A-MoE单卡Expert-Offloading实验篇.md`——在 Day11 的 `Qwen3MoEMLP` 上叠一层 CPU↔GPU expert hot-swap，让 8GB 单卡也能"按需加载 expert"，配合 routing 频次统计把热点 expert 钉在 GPU 上。
-- **继续主线进阶**：`Day12-FP8与KV-Cache量化实验篇.md`——KV cache 低精度存储。
+- **继续主线进阶**：`Day12-KV-Cache量化（int8模拟）.md`——KV cache 低精度存储（int8 量化模拟，FP8 仅认知讲解）。
 
 两条路径互不冲突：11A 管"参数 offload"，12 管"KV 精度"，正交。

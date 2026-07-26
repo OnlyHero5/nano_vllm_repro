@@ -1,4 +1,8 @@
-# Day 12 — KV Cache 量化：用更少的位存 KV
+# Day 12 — KV Cache 量化（int8 模拟，FP8 认知篇）
+
+> **本篇边界**：这里落地的是 KV cache 的 **int8 对称量化模拟**（`int8_sim`，以及用 int8 容器模拟更粗粒度取值的 `pseudo_fp8_sim`）。全篇**不涉及** `torch.float8_e4m3fn` 等 float8 dtype、`torch._scaled_mm`、Hopper FP8 GEMM 或 FlashAttention 的 FP8 cache kernel——真 FP8 只做原理讲解。要讲透的是"低精度容器 + scale + 写前量化 / 读前反量化"这套协议边界，它换成任何精度都成立。
+>
+> **前置依赖**：本篇修改 `config.py / engine/model_runner.py / utils/context.py / layers/attention.py`，以主线 Day1-Day6 落地后的代码为基础。
 
 KV cache 是长上下文推理的显存大户。当前主线用 fp16 存每个 token 的 K 和 V——如果改成 int8 甚至模拟 fp8，显存直接砍半或更多。代价是精度损失，但 KV cache 对精度的容忍度比权重高得多。
 
@@ -26,7 +30,7 @@ KV cache 量化接入主线，涉及六个接触点：
 1. `config.py`：明确开关，默认保持 fp16。
 2. `utils/kvcache_quant.py`：量化协议——container 选择、scale 计算、quantize/dequantize、教学版 attention hook。
 3. `engine/model_runner.py`：`allocate_kv_cache()` 不再只分配裸 `torch.float16` tensor；量化路径需要每层 cache 和 scale buffers 成对保存。
-4. `utils/context.py`：`Context.kv_cache` 类型要能表达”裸 fp16 tensor”和”携带量化元数据的 view”。
+4. `utils/context.py`：`Context.kv_cache` 类型要能表达“裸 fp16 tensor”和“携带量化元数据的 view”。
 5. `layers/attention.py`：写 cache 前可以量化，读 cache 喂给 FlashAttention 前必须反量化到 fp16/bf16。
 6. `tests/test_Day12_kvcache_quant.py`：不依赖真实大模型，只验证量化协议、默认路径和 hook 形状语义。
 
@@ -492,7 +496,7 @@ def get_kv_cache_for_attention(
     return k_cache, v_cache
 ```
 
-### 4.1 两种教学方案的含义
+### 4.1 两种模拟方案的含义
 
 - `int8_sim`：标准对称 int8 量化模拟，按 block + KV head 维护 scale。
 - `pseudo_fp8_sim`：仍使用 int8 container，但缩小整数范围并做粗粒度 snapping，用来观察“更低有效精度”对 cache roundtrip 的影响。
@@ -964,7 +968,7 @@ if __name__ == "__main__":
 
 在 `nano_vll_repro/` 目录运行：
 
-先跑计划要求的最小协议命令：
+先跑最小协议命令：
 
 ```bash
 python -m py_compile utils/kvcache_quant.py tests/test_Day12_kvcache_quant.py
@@ -998,10 +1002,10 @@ python -m py_compile config.py utils/kvcache_quant.py engine/model_runner.py uti
 
 ## 11. 读完你应该明白
 
-1. `kv_cache_dtype=”fp16”` + `kv_cache_quant_scheme=”none”` 为什么保持当前主线行为。
+1. `kv_cache_dtype="fp16"` + `kv_cache_quant_scheme="none"` 为什么保持当前主线行为。
 2. `int8_sim` / `pseudo_fp8_sim` 如何通过低精度 container + per-block/per-head scale 表达 KV cache 量化。
 3. `ModelRunner.allocate_kv_cache()` 为什么需要把量化 cache 和 scale buffers 按层绑定。
 4. `Context.kv_cache` 为什么需要表达 `torch.Tensor | KVCacheView`。
-5. `layers/attention.py` 为什么是”写前量化、读前反量化”，而不是直接声明支持生产级 FP8 FlashAttention。
+5. `layers/attention.py` 为什么是“写前量化、读前反量化”，而不是直接声明支持生产级 FP8 FlashAttention。
 
-下一篇：`Day13-GPU-Offload与跨后端扩展总览.md`。
+下一篇：`Day13-CPU-KV-Block-Offload.md`（内容是 CPU KV block swap）。

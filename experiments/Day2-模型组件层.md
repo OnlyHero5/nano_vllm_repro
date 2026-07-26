@@ -2,9 +2,30 @@
 
 ## 本篇定位
 
-今天复习四个最基础的 Transformer 组件：**RMSNorm**、**SwiGLU**、**RoPE**、**融合 Linear**。
+本篇拆开四个最基础的 Transformer 组件：**RMSNorm**、**SwiGLU**、**RoPE**、**融合 Linear**。
 
 这四个模块构成了 Qwen3 模型的"积木"，它们全部放在 `layers/` 目录下，互不依赖，可以独立测试。
+
+> **环境陷阱：`layers/__init__.py` 的 eager import**
+>
+> 当前 `layers/__init__.py` 长这样：
+>
+> ```python
+> from .layernorm import RMSNorm
+> from .activation import SiluAndMul
+> from .rotary_embedding import RotaryEmbedding, get_rope, apply_rotary_emb
+> from .attention import Attention, store_kvcache   # ← 问题在这里
+> ```
+>
+> 第 4 行 `from .attention import ...` 会在 `import layers` 时立即触发 `attention.py` 顶部的 `import flash_attn`。后果：**没装 flash_attn 时，连 `from layers.layernorm import RMSNorm` 这种纯 torch 模块都导入失败**——因为 Python 导入任何子模块都会先执行包的 `__init__.py`。
+>
+> 这是"测试套件跑不起来"的最大单一原因（test_Day2 / test_Day3 整体无法收集，test_Day4 的 `test_linear_layers` / `test_sampler` 直接 `ModuleNotFoundError`），而且和代码逻辑无关。
+>
+> **修复方向**（二选一）：
+> 1. 把 `from .attention import ...` 从 `__init__.py` 删掉，需要方直接 `from layers.attention import Attention`；
+> 2. 改为惰性导入（在函数内部 import，或用 `__getattr__` 模块级延迟加载）。
+>
+> 本篇的四个组件（RMSNorm / SwiGLU / RoPE / 融合 Linear）本身不依赖 flash_attn。如果你想在纯 CPU 环境下跑本篇的验证脚本，先按上面方式 1 改掉 `__init__.py`，或者确保已安装 `flash-attn`。
 
 读完本篇后，你应该能：
 - 解释 RMSNorm 和 LayerNorm 的区别
@@ -38,7 +59,7 @@ RMSNorm(x) = x / sqrt(mean(x²) + ε) * γ
 
 **还有一个重要的优化**：把残差连接（`x = x + residual`）和 RMSNorm 融合成一步做，减少一次显存读写。在 Pre-Norm Transformer 中，每层都要做 `x + residual → RMSNorm`，融合后只用读一次写一次。
 
-### 已有代码回顾
+### 这一版长什么样
 
 你的 `layers/layernorm.py` 实现了两个 forward 路径：
 
@@ -63,39 +84,16 @@ def add_rms_forward(self, x, residual):
 - 中间计算用 `float()` 提升精度，最后转回 `orig_dtype`（通常是 bf16）
 - `mul_()` 和 `add_()` 是原地操作（inplace），减少显存分配
 
-### 当前问题
+### 这一层要动的地方
 
-当前代码没有功能问题，RMSNorm 的实现质量很高。但有一个 docstring 拼写错误需要修正：
-
-**`layers/layernorm.py` 第 82 行**：`redisual` 应为 `residual`
-**`layers/layernorm.py` 第 85 行**：`normalized_putput` 应为 `normalized_output`
-
-```python
-# ❌ 当前（拼写错误）
-Args:
-    x: 当前层输入
-    redisual: 残差连接的输入
-
-Returns:
-    (normalized_putput, new_residual)
-
-# ✅ 应改为
-Args:
-    x: 当前层输入
-    residual: 残差连接的输入
-
-Returns:
-    (normalized_output, new_residual)
-```
-
-功能不受影响，但作为学习材料，docstring 的准确性很重要。
+功能上一处都不用改——这一版 RMSNorm 立得很稳：两条路径分工清晰，精度提升和原地操作都用在了该用的地方。这一层是全书里少见的"读完即可放行"的一层。
 
 ### 完整代码
 
-这个文件当前质量很好，我们保持不动。下面是带详细注释的完整版本供参考：
+下面是带详细注释的完整版本，行为与你手上的实现一致（只顺手校正了 docstring 里的两处拼写：`redisual` → `residual`、`normalized_putput` → `normalized_output`）：
 
 ```python
-# layers/layernorm.py — 完整代码（与当前一致，加注释）
+# layers/layernorm.py — 完整代码
 
 """RMSNorm 实现
 
@@ -255,7 +253,7 @@ print(f'纯 RMSNorm:  输入 {x.shape} → 输出 {out.shape}')
 residual = torch.randn_like(x)
 out2, new_res = norm(x, residual)
 print(f'残差融合版: 输出 {out2.shape}, 残差 {new_res.shape}')
-print('✅ RMSNorm 工作正常')
+print('RMSNorm 工作正常')
 "
 ```
 
@@ -292,7 +290,7 @@ output = down_proj(SiLU(gate_proj(x)) ⊙ up_proj(x))
 
 **SiLU** 就是 Swish 激活函数：`SiLU(x) = x * sigmoid(x)`，它比 ReLU 更平滑，梯度不会在负数区直接截断。
 
-### 已有代码回顾
+### 这一版长什么样
 
 你的 `layers/activation.py` 实现很精简：
 
@@ -305,9 +303,9 @@ class SiluAndMul(nn.Module):
 
 这里 `x` 是 `gate_up_proj` 的输出，已经拼接了 gate 和 up 两个投影的结果。`chunk(2, dim=-1)` 沿最后一维平分，前一半是 gate，后一半是 up。
 
-### 当前问题
+### 这一版的薄弱处
 
-当前代码没有需要修改的地方。
+没有——这一层可以原样留着。
 
 ### 完整代码
 
@@ -381,7 +379,7 @@ x = torch.randn(4, 10, 512)  # 2 * intermediate = 512
 out = act(x)
 print(f'输入 {x.shape} → 输出 {out.shape}')  # 应该变成 [4, 10, 256]
 assert out.shape == (4, 10, 256)
-print('✅ SwiGLU 工作正常')
+print('SwiGLU 工作正常')
 "
 ```
 
@@ -418,7 +416,7 @@ inv_freq[i] = 1 / (base^(2i / dim))
 ```
 `base` 通常取 10000（LLaMA）或 1000000（Qwen3-0.6B）。
 
-### 已有代码回顾
+### 这一版长什么样
 
 你的实现分为三部分：
 
@@ -430,7 +428,7 @@ inv_freq[i] = 1 / (base^(2i / dim))
 - `cos_sin_cache` 用 `register_buffer` 注册（不参与梯度，随模型保存/加载）
 - `torch.compile` 加速 forward
 
-### 当前问题
+### 这一版的薄弱处
 
 `get_rope()` 当收到 `rope_scaling` 参数时应该明确报错，而不是静默忽略。当前代码只做了 `assert`，但如果模型配置了 yarn 等 RoPE 扩展，这里应该给更清晰的错误信息。
 
@@ -652,7 +650,7 @@ q_norm_before = q.norm(dim=-1).mean()
 q_norm_after = q_rot.norm(dim=-1).mean()
 print(f'Q 模长变化: {q_norm_before:.4f} → {q_norm_after:.4f} (应几乎不变)')
 assert torch.allclose(q_norm_before, q_norm_after, atol=1e-4)
-print('✅ RoPE 工作正常')
+print('RoPE 工作正常')
 "
 ```
 
@@ -717,7 +715,7 @@ for original_name, (packed_name, shard_id) in packed_modules_mapping.items():
 
 这正是 loader.py 能"不理解内部布局"的关键——它只需要根据 mapping 把权重分发给对应的 weight_loader。
 
-### 已有代码回顾
+### 这一版长什么样
 
 你的 `layers/linear.py` 实现了三种融合 Linear：
 
@@ -727,7 +725,7 @@ for original_name, (packed_name, shard_id) in packed_modules_mapping.items():
 | `MergedLinear` | FFN 的 gate+up 投影 | gate_proj + up_proj | [gate | up] |
 | `RowLinear` | o_proj 和 down_proj | 无融合（单卡版就是普通 Linear） | 普通 |
 
-### 当前问题
+### 这一版的薄弱处
 
 1. **`QKVLinear` 只给 `weight` 绑了 `weight_loader`，没有给 `bias` 绑定**。如果模型有 bias（实际 Qwen3-0.6B 没有，但写代码要考虑健壮性），bias 不会被加载。
 2. **`default_weight_loader` 缺少 dtype/device 对齐**。如果 safetensors 是 fp32 存 CPU、模型参数是 bf16 存 GPU，直接 `copy_` 可能报错或不精确。
@@ -1021,7 +1019,7 @@ class RowLinear(nn.Module):
         return nn.functional.linear(x, self.weight, self.bias)
 ```
 
-### 改动总结（相比旧代码）
+### 改动总结
 
 | 改动 | 位置 | 原因 |
 |------|------|------|
@@ -1056,7 +1054,7 @@ qkv._weight_loader(qkv.weight, v_weight, 'v')
 assert torch.allclose(qkv.weight.data[:512], q_weight)
 assert torch.allclose(qkv.weight.data[512:640], k_weight)
 assert torch.allclose(qkv.weight.data[640:], v_weight)
-print('✅ QKVLinear weight_loader 正确')
+print('QKVLinear weight_loader 正确')
 
 # ── 测试 MergedLinear ──
 merged = MergedLinear(512, 256, num_shards=2)
@@ -1066,17 +1064,17 @@ merged._weight_loader(merged.weight, gate, 0)
 merged._weight_loader(merged.weight, up, 1)
 assert torch.allclose(merged.weight.data[:256], gate)
 assert torch.allclose(merged.weight.data[256:], up)
-print('✅ MergedLinear weight_loader 正确')
+print('MergedLinear weight_loader 正确')
 
 # ── 测试 forward ──
 x = torch.randn(10, 512)
 out = qkv(x)
 assert out.shape == (10, qkv.total_size)
-print(f'✅ QKVLinear forward: {x.shape} → {out.shape}')
+print(f'QKVLinear forward: {x.shape} → {out.shape}')
 
 out = merged(x)
 assert out.shape == (10, 512)
-print(f'✅ MergedLinear forward: {x.shape} → {out.shape}')
+print(f'MergedLinear forward: {x.shape} → {out.shape}')
 
 # ── 测试 dtype 对齐 ──
 # 模拟：dummy param 在 CUDA 上，loaded weight 在 CPU
@@ -1086,19 +1084,19 @@ if torch.cuda.is_available():
     copy_weight_to_param(p, w)
     assert p.device.type == 'cuda'
     assert p.dtype == torch.bfloat16
-    print('✅ dtype/device 对齐正确')
+    print('dtype/device 对齐正确')
 else:
     p = torch.nn.Parameter(torch.empty(4, dtype=torch.bfloat16))
     w = torch.ones(4, dtype=torch.float32)
     copy_weight_to_param(p, w)
     assert p.dtype == torch.bfloat16
-    print('✅ dtype 对齐正确（CPU 环境）')
+    print('dtype 对齐正确（CPU 环境）')
 "
 ```
 
 ---
 
-## 5. ✅ 验证步骤
+## 5. 验证步骤
 
 ```bash
 cd nano_vll_repro
@@ -1110,23 +1108,46 @@ python -m py_compile layers/layernorm.py layers/activation.py layers/rotary_embe
 python tests/test_Day2.py
 ```
 
-> **⚠️ 现有 `tests/test_Day2.py` 有以下 bug，需要先修复再运行：**
+> **`tests/test_Day2.py` 有两个典型的易错点，下面把错误写法与修正写法对照讲解：**
 >
-> **Bug**：`test_gqa()` 中 `attn()` 多传了 `attention_mask=None` 参数（第 242 行）。
+> **易错点 1**：`test_gqa()` 中给 `attn()` 多传 `attention_mask=None` 参数。
 > `Qwen3Attention.forward()` 的签名是 `(self, positions, hidden_states)`，没有 `attention_mask` 参数。
 > ```python
-> # ❌ 错误（当前代码）
+> # 错误写法
 > output = attn(positions, hidden_states, attention_mask=None)
 >
-> # ✅ 正确
+> # 正确
 > output = attn(positions, hidden_states)
 > ```
+>
+> **易错点 2**：`test_qwen3_model()` 若没有设置 Context 就调用 `model(input_ids)`，会崩溃在 `None[layer_idx]`。
+>
+> 诊断过程：`Attention.forward()` 里第一步是 `context = get_context()`。不调用 `set_context()` 时拿到的是默认的空 `Context()`——`kv_cache=None`、`slot_mapping=None`（这两个 None 只是让它跳过 `store_kvcache`，不报错），但 `is_prefill` 默认是 `False`，于是走进 `_decode_attention()`，第一行就是：
+> ```python
+> kv_cache = context.kv_cache[self.layer_idx]
+> # TypeError: 'NoneType' object is not subscriptable
+> ```
+> 报错点在 decode 路径，**根因却是没设 Context**——空 Context 的 `is_prefill=False` 把一次本该是 prefill 的前向骗进了 decode 分支。
+>
+> 修复：前向之前设置一个 prefill Context（`kv_cache` 保持 `None` 即可，Attention 会跳过 cache 写入，走纯 FlashAttention varlen 路径），前向之后 `reset_context()`：
+> ```python
+> set_context(Context(
+>     is_prefill=True,
+>     cu_seqlens_q=torch.tensor([0, num_tokens], dtype=torch.int32, device='cuda'),
+>     cu_seqlens_k=torch.tensor([0, num_tokens], dtype=torch.int32, device='cuda'),
+>     max_seqlen_q=num_tokens,
+>     max_seqlen_k=num_tokens,
+> ))
+> logits = model(input_ids)
+> reset_context()
+> ```
+> 这也是 Day1 §1.4 讲的全局 Context 模式的反面教材：**任何直接调用模型 forward 的代码（包括测试）都必须先把 Context 摆好。**
 
 ---
 
 ## 本篇小结
 
-今天我们复习了 Transformer 的四个基础积木块：
+本篇过了一遍 Transformer 的四个基础积木块：
 
 | 模块 | 核心原理 | 在大模型中的角色 |
 |------|---------|----------------|

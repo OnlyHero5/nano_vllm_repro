@@ -1,5 +1,7 @@
 # Day 11A — Expert Offloading：8GB 卡怎么跑 32 个 expert
 
+> **前置依赖**：本篇代码 import 的 `MoEExpert / MoERouter / Qwen3MoEMLP` 来自 **Day11** §4.2-4.4（需要你先把它们写进 `models/qwen3.py`，仓库基线里没有）。详细自检见 §3。本篇自带的测试与 demo 在 CPU 和 CUDA 上都能跑通（§8/§9 给出了实际运行输出）。
+
 Day11 的 `Qwen3MoEMLP` 把所有 expert 权重都放在 GPU 上。8 个 expert 还好，32 个就炸了——MoE 的显存压力主要出在 expert 权重上，不是 attention 或 KV cache。
 
 经典的解法是 **expert-level offloading**：
@@ -24,10 +26,10 @@ Day11 的 `Qwen3MoEMLP` 把所有 expert 权重都放在 GPU 上。8 个 expert 
 
 | 范围 | 做 | 不做 |
 |---|---|---|
-| Expert 权重 CPU↔GPU 换入换出 | ✅ | ❌ all-to-all、expert parallel |
-| LRU + 热门 pin | ✅ | ❌ 异步 prefetch overlap（给出扩展点） |
-| 与 Day11 `Qwen3MoEMLP` 输出等价性自检 | ✅ | ❌ 改 `models/qwen3.py` 主线 |
-| 真实 Qwen1.5-MoE / DeepSeek-V2-Lite 跑通 | ❌（示例参数 + 随机权重） | — |
+| Expert 权重 CPU↔GPU 换入换出 | 是 | all-to-all、expert parallel |
+| LRU + 热门 pin | 是 | 异步 prefetch overlap（给出扩展点） |
+| 与 Day11 `Qwen3MoEMLP` 输出等价性自检 | 是 | 改 `models/qwen3.py` 主线 |
+| 真实 Qwen1.5-MoE / DeepSeek-V2-Lite 跑通 | 否（示例参数 + 随机权重） | — |
 
 所有机械动作都暴露出来，但模型大小由 `--num-experts/--hidden/--intermediate` 控制，CI 可在 CPU 上 30 秒内跑完。
 
@@ -582,45 +584,52 @@ if __name__ == "__main__":
     main()
 ```
 
-典型输出（CUDA，`hidden=128 intermediate=256`）：
+以下是**实测输出**（按本篇代码原样落盘后运行：CUDA 单卡、torch 2.10、`--seed 0` 默认值。stats 字典略去 `expert_call_count/pinned` 字段以便排版，命中数完整保留）：
 
 **默认（均匀随机输入）**：
 
 ```
 $ python -m experiments.moe_offloading.run_demo --pin-top 1
+[Config] device=cuda dtype=torch.float32 biased_input=False
+[Config] hidden=128 intermediate=256 num_experts=8 top_k=2 num_slots=2
 [Equivalence] max |y_ref - y_off| = 0.000e+00
 [Warmup] expert_call_count = [31, 31, 31, 31, 31, 31, 31, 31]   # 完全均匀
-[Pin]    pinned experts = [0]
-[Measure] post-pin stats = {'hits': 100, 'misses': 700, 'hit_rate': 0.125, ...}
-[Summary] hit_rate=0.125  GPU resident experts <= 2
+[Pin] pinned experts = [0]
+[Measure] post-pin stats   = {'hits': 120, 'misses': 840, 'hit_rate': 0.125, ...}
+[Summary] hit_rate=0.125  GPU resident experts <= 2  (参考实现需要 8)
 ```
 
-注意这里 hit_rate = `1/num_experts` = `1/8 = 0.125`。这是**最坏情况**：随机权重 + 随机输入 → 路由完全均匀 → 每个 step 都会请求所有 8 个 expert → 单个 LRU slot 始终在被换入换出 → 只有被 pin 的 expert 0 稳定命中。
+（warmup 计数 31 = 30 个 warmup step + 1 次等价性自检；measure 阶段 120 step，每个 expert 都被请求 120 次。）
+
+注意这里 hit_rate = `1/num_experts` = `1/8 = 0.125`。这是**最坏情况**：随机权重 + 随机输入 → 路由完全均匀 → 每个 step 都会请求所有 8 个 expert → 单个 LRU slot 始终在被换入换出 → 只有被 pin 的 expert 0 稳定命中（120 次 hit 全部来自它）。
 
 **偏斜输入（更接近真实 MoE 路由分布）**：
 
 ```
 $ python -m experiments.moe_offloading.run_demo --pin-top 1 --biased-input
 [Warmup] expert_call_count = [31, 0, 0, 31, 1, 0, 31, 31]       # 4 个 expert 几乎包揽
-[Pin]    pinned experts = [0]
-[Measure] post-pin stats = {'hits': 100, 'misses': 300, 'hit_rate': 0.250, ...}
-[Summary] hit_rate=0.250  GPU resident experts <= 2
+[Pin] pinned experts = [0]
+[Measure] post-pin stats   = {'hits': 120, 'misses': 362, 'hit_rate': 0.249, ...}
+[Summary] hit_rate=0.249  GPU resident experts <= 2  (参考实现需要 8)
 
 $ python -m experiments.moe_offloading.run_demo --num-slots 3 --pin-top 2 --biased-input
-[Pin]    pinned experts = [0, 3]
-[Measure] post-pin stats = {'hits': 200, 'misses': 200, 'hit_rate': 0.500, ...}
-[Summary] hit_rate=0.500  GPU resident experts <= 3
+[Pin] pinned experts = [0, 3]
+[Measure] post-pin stats   = {'hits': 240, 'misses': 242, 'hit_rate': 0.498, ...}
+[Summary] hit_rate=0.498  GPU resident experts <= 3  (参考实现需要 8)
 
 $ python -m experiments.moe_offloading.run_demo --num-experts 16 --num-slots 4 --pin-top 2 --biased-input
 [Warmup] expert_call_count = [5, 0, 0, 31, 0, 0, 31, 31, 0, 0, 31, 31, 0, 0, 0, 0]
-[Measure] post-pin stats = {'hits': 200, 'misses': 312, 'hit_rate': 0.391, ...}
-[Summary] hit_rate=0.391  GPU resident experts <= 4  (参考实现需要 16)
+[Pin] pinned experts = [3, 6]
+[Measure] post-pin stats   = {'hits': 240, 'misses': 376, 'hit_rate': 0.390, ...}
+[Summary] hit_rate=0.390  GPU resident experts <= 4  (参考实现需要 16)
 ```
+
+（`--num-experts 16` 时按频次 pin 出来的是 `[3, 6]`——排序对并列计数（31 次）的 expert 取先出现者，具体是哪两个取决于随机路由，你机器上可能不同；命中率量级不受影响。）
 
 `--biased-input` 把输入限制成"几个固定 topic + 小扰动"，模拟真实语料里"几个话题反复出现"的局部性。可以观察到：
 
 1. 等价性差异恒为 0（或极小数值噪声）。
-2. 偏斜输入下 8 个 expert 中只有 4 个真正活跃，pin 1 个就把命中率从 12.5% 翻倍到 25%；pin 2 个 + 多 1 个 LRU 槽位，命中率达到 50%。
+2. 偏斜输入下 8 个 expert 中只有 4 个真正活跃，pin 1 个就把命中率从 12.5% 翻倍到 ~25%（实测 24.9%）；pin 2 个 + 多 1 个 LRU 槽位，命中率达到 ~50%（实测 49.8%）。
 3. 把 `--num-experts` 拉到 16，pin 2 个仍能拿到 ~40% 命中率，说明扩展到更大 MoE 时收益不会消失。
 
 为什么这个对比很重要：
@@ -934,4 +943,4 @@ tests/test_Day11A_offloading.py
 3. 为什么用"独立实验目录 + 不动主线"的形式，而 Day11 可以直接修改 `models/qwen3.py`。
 4. 异步 prefetch、speculative routing、跨节点 expert parallel 各自解决什么瓶颈。
 
-下一篇回到主线进阶：`Day12-FP8与KV-Cache量化实验篇.md`。
+下一篇回到主线进阶：`Day12-KV-Cache量化（int8模拟）.md`（内容是 KV cache int8 量化模拟，FP8 仅认知讲解）。

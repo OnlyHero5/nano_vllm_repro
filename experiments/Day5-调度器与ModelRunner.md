@@ -130,9 +130,9 @@ ModelRunner 每轮执行需要：
 
 ---
 
-## 3. 已有代码回顾：Scheduler
+## 3. Scheduler 现在长什么样
 
-### 3.1 当前代码结构
+### 3.1 代码结构
 
 ```python
 class Scheduler:
@@ -156,7 +156,7 @@ class Scheduler:
         # 抢占：释放 KV Cache，放回 waiting 队首
 ```
 
-### 3.2 当前代码的判断逻辑
+### 3.2 判断逻辑
 
 ```python
 # Prefill: 检查是否还有 capacity
@@ -170,9 +170,9 @@ if not self.block_manager.can_allocate(seq):
 
 ---
 
-## 4. 已有代码回顾：ModelRunner
+## 4. ModelRunner 现在长什么样
 
-### 4.1 当前代码结构
+### 4.1 代码结构
 
 ```python
 class ModelRunner:
@@ -192,7 +192,7 @@ class ModelRunner:
         # 准备输入 → 模型前向 → 采样 → 返回 token IDs
 ```
 
-### 4.2 ⚠️ 当前代码的问题
+### 4.2 薄弱处
 
 **问题1：`run()` 没有调用 `reset_context()`**
 
@@ -208,7 +208,7 @@ def run(self, sequences, is_prefill):
     # 取 logits...
     next_tokens = self.sampler(logits, temperatures)
     return next_tokens.tolist()
-    # ⚠️ 缺少 reset_context()！
+    # 问题：缺少 reset_context()！
 ```
 
 **问题2：`LLMEngine.step()` 的 token 统计不准**
@@ -216,7 +216,7 @@ def run(self, sequences, is_prefill):
 ```python
 # 当前代码：
 if is_prefill:
-    num_tokens = sum(len(seq) for seq in seqs)  # ⚠️ 包含了已缓存的 prefix token！
+    num_tokens = sum(len(seq) for seq in seqs)  # 问题：包含了已缓存的 prefix token！
 ```
 
 已缓存的前缀 token 不应该被重复统计。
@@ -227,7 +227,7 @@ if is_prefill:
 
 ---
 
-## 5. ⚠️ 需要修复的内容
+## 5. 需要修复的内容
 
 | 修复项 | 文件 | 改动 |
 |--------|------|------|
@@ -238,8 +238,8 @@ if is_prefill:
 | `postprocess()` 更新 cached 计数 | `engine/scheduler.py` | 在 append_token 前标记 num_cached_tokens |
 | **Sampler 调用缺 top_k/top_p** | `engine/model_runner.py` | **从 Sequence 读取 top_k/top_p 并传给 Sampler** |
 
-> **重要**：Day4 将 `Qwen3ForCausalLM.forward()` 改为只返回 hidden_states，本篇的 `run_model()` 已同步此改动。
-> 如果你跳过了 Day4 直接看 Day5，需要先完成 Day4 的 forward/compute_logits 拆分。
+> **重要**：Day4 已把 `Qwen3ForCausalLM.forward()` 改成只返回 hidden_states，所以本篇的 `run_model()` 必须自己调 `compute_logits()`。
+> 如果你跳过 Day4 直接看 Day5，先回去完成 forward/compute_logits 的拆分，否则这里拿不到 logits。
 
 ---
 
@@ -1018,7 +1018,7 @@ class LLMEngine:
         ]
 
         # ── 步骤5：计算 token 统计 ──
-        # ★ 修复：prefill 只统计本轮新计算的 token（不含已缓存前缀）
+        # 修复：prefill 只统计本轮新计算的 token（不含已缓存前缀）
         if is_prefill:
             num_tokens = sum(
                 len(seq) - seq.num_cached_tokens
@@ -1130,6 +1130,7 @@ python tests/test_Day3.py
 
 > **注意**：如果 `test_Day3.py` 报错，请参考 Day3 指南「验证步骤」中的 bug 修复说明。
 
+```bash
 # 3. 快速手动验证 Context 清理
 python - <<'PY'
 from utils.context import get_context, reset_context

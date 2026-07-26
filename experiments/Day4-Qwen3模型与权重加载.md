@@ -12,7 +12,7 @@
 
 ---
 
-## 1. 📖 知识点讲解
+## 1. 知识点讲解
 
 ### 1.1 Qwen3 模型结构
 
@@ -157,9 +157,9 @@ loader.py 的工作流程：
 
 ---
 
-## 2. 🔍 已有代码回顾
+## 2. 这一层现在长什么样
 
-### models/qwen3.py（回忆关键部分）
+### models/qwen3.py（关键部分）
 
 当前代码已经完整实现了 Qwen3 的四个层级：
 
@@ -197,7 +197,7 @@ attn_output = self.attn(q, k, v)
 return self.o_proj(attn_output.reshape(num_tokens, -1))
 ```
 
-### utils/loader.py（回忆关键逻辑）
+### utils/loader.py（关键逻辑）
 
 loader 的核心循环：
 
@@ -222,7 +222,7 @@ for weight_name in f.keys():
 
 ---
 
-## 3. ⚠️ 当前代码的问题
+## 3. 这一版的薄弱处
 
 ### 问题 1：forward() 直接返回 logits
 
@@ -255,10 +255,10 @@ def compute_logits(self, hidden_states):
 
 当前代码：
 ```python
-# ❌ 当前（第 380 行）
+# 当前（第 380 行）
 def from_pretrained(cls, mode_path: str):
 
-# ✅ 正确应为
+# 正确应为
 def from_pretrained(cls, model_path: str):
 ```
 
@@ -266,7 +266,7 @@ def from_pretrained(cls, model_path: str):
 
 ---
 
-## 4. 📝 完整代码
+## 4. 完整代码
 
 ### 4.1 `models/qwen3.py`（修改后完整版）
 
@@ -870,7 +870,7 @@ def load_model_weights(model: nn.Module, model_path: str):
 
 ---
 
-## 5. ✅ 验证步骤
+## 5. 验证步骤
 
 ```bash
 cd nano_vll_repro
@@ -906,7 +906,7 @@ assert logits.shape == (num_tokens, config.vocab_size), "compute_logits 应返�
 # 验证 forward 不再返回 logits
 assert hidden_states.shape[-1] == config.hidden_size, "forward 不应返回 vocab_size 维度"
 
-print("\n✅ 接口验证通过")
+print("\n接口验证通过")
 PY
 
 # 3. 加载真实权重并跑一次前向
@@ -933,24 +933,24 @@ with torch.inference_mode():
 print(f"Hidden states 形状: {hidden.shape}")
 print(f"Logits 形状: {logits.shape}")
 print(f"Next token: {next_token}")
-print("✅ 权重加载和前向传播正常")
+print("权重加载和前向传播正常")
 PY
 
 # 4. 跑 milestones 测试
 python tests/test_Day4.py
 ```
 
-> **⚠️ 现有 `tests/test_Day4.py` 有以下 bug，需要先修复再运行：**
+> **`tests/test_Day4.py` 有一个容易写错的地方，对照如下：**
 >
-> **Bug**：第 3 行硬编码了绝对路径，换台机器就跑不了。
+> **易错点**：在文件开头硬编码绝对路径，换台机器就跑不了。
 > ```python
-> # ❌ 错误（当前代码）
-> sys.path.insert(0, '/home/psx/nano_vllm_repro/nano_vll_repro')
+> # 错误写法
+> sys.path.insert(0, '/path/to/nano_vll_repro')
 >
-> # ✅ 正确
+> # 正确
 > sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 > ```
-> 同时需要在文件顶部补上 `import os`。
+> 同时文件顶部需要 `import os`。
 
 **预期输出：**
 - QKVLinear / MergedLinear weight_loader 正确写入融合权重
@@ -959,17 +959,17 @@ python tests/test_Day4.py
 
 ---
 
-## 6. 📋 Day4 检查清单
+## 6. Day4 检查清单
 
 | 检查项 | 说明 |
 |--------|------|
-| ☐ Qwen3Attention 理解 GQA | 能解释 `num_heads=16, num_kv_heads=8` 的含义 |
-| ☐ 理解 Q/K Norm 的作用 | RoPE 之前做归一化，让分布更稳定 |
-| ☐ 理解 Pre-Norm 架构 | Norm 在子层之前，残差融合减少内存访问 |
-| ☐ forward() → hidden states | 不再返回 logits |
-| ☐ compute_logits() 独立 | lm_head 投影单独出来 |
-| ☐ packed_modules_mapping | 理解 HF 分离权重 → 本地融合权重的映射协议 |
-| ☐ loader.py 的 for...else | 命中了 break，没命中走 else |
+| Qwen3Attention 理解 GQA | 能解释 `num_heads=16, num_kv_heads=8` 的含义 |
+| 理解 Q/K Norm 的作用 | RoPE 之前做归一化，让分布更稳定 |
+| 理解 Pre-Norm 架构 | Norm 在子层之前，残差融合减少内存访问 |
+| forward() → hidden states | 不再返回 logits |
+| compute_logits() 独立 | lm_head 投影单独出来 |
+| packed_modules_mapping | 理解 HF 分离权重 → 本地融合权重的映射协议 |
+| loader.py 的 for...else | 命中了 break，没命中走 else |
 
 ---
 
@@ -980,4 +980,4 @@ python tests/test_Day4.py
 3. **packed_modules_mapping + weight_loader 是框架设计中"关注点分离"的典范**：loader 负责路由，参数负责写入逻辑
 4. **Qwen3 与 LLaMA 的关键差异**：Q/K Norm（Qwen3 有，LLaMA 没有）
 
-下一篇：**Day5 — 调度器与 ModelRunner**（Scheduler / ModelRunner 的已有代码回顾与修复）
+下一篇：**Day5 — 调度器与 ModelRunner**（Scheduler / ModelRunner，读透与改进）

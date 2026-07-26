@@ -1,5 +1,9 @@
 # Day 13 — CPU KV Block Offload：显存不够时把 KV 换到内存
 
+> **本篇边界**：这里落地的是 KV block 的 GPU↔CPU 换入换出（swap）——不是权重 offload，不涉及跨后端（JAX / MLX / C++）实现，也不含生产级 KV connector / LMCache / 异步 prefetch。一条 swap 通路讲透，比铺开三条讲不透更有用。
+>
+> **前置依赖**：本篇修改 `engine/sequence.py / engine/block_manager.py / engine/model_runner.py / engine/scheduler.py`，以主线 Day1-Day6 落地后的代码为基础。
+
 当前主线在 GPU KV block 不够时，做法很粗暴：把 sequence preempt 回 `WAITING`，释放 KV cache，下一轮重新 prefill。已经算过的 KV 全扔了，重来一遍。
 
 更好的做法是 **swap**：把 KV block 从 GPU copy 到 CPU 内存，腾出 GPU 块给别人用；等这条序列需要继续 decode 时，再从 CPU copy 回来。像操作系统的页面换入换出。
@@ -8,7 +12,7 @@
 
 五个改动点：
 
-1. `SequenceStatus.SWAPPED`：让请求状态能表达”KV 已换出到 CPU，等待换回 GPU”。
+1. `SequenceStatus.SWAPPED`：让请求状态能表达“KV 已换出到 CPU，等待换回 GPU”。
 2. `BlockResidency` 元数据：让 `BlockManager` 同时知道 block 的逻辑归属和物理驻留位置。
 3. `ModelRunner` CPU KV buffer：按层把 KV block 在 GPU cache 和 CPU buffer 之间 copy。
 4. `Scheduler` 队列变化：GPU blocks 不够时换出 running sequence；需要继续 decode 时换回。
@@ -1065,7 +1069,7 @@ python tests/test_Day13_kv_offload.py
 ## 10. 读完你应该明白
 
 1. `SWAPPED` 与 `WAITING` 的区别：`SWAPPED` 保留 CPU KV backing store，不需要重新 prefill；`WAITING` 表示还没有可复用 KV，调度时要走 prefill。
-2. `BlockManager` 除了管理”哪个 logical block 映射到哪个 GPU block”，还可以管理”这个 logical block 当前驻留在 CPU 还是 GPU”。
+2. `BlockManager` 除了管理“哪个 logical block 映射到哪个 GPU block”，还可以管理“这个 logical block 当前驻留在 CPU 还是 GPU”。
 3. `ModelRunner` 是 KV tensor copy 的正确边界，因为它持有每层 `kv_cache` tensor。
 4. `Scheduler` 是状态转换的正确边界，因为它决定 sequence 何时 running、何时 swapped、何时换回。
 5. 对这个学习项目来说，CPU KV block offload 的最小闭环是：状态枚举、residency 元数据、copy helper、swapped 队列和不依赖真实模型的测试。

@@ -43,15 +43,22 @@ nano_vll_repro/
 │   ├── test_Day2.py           # 模型主干测试
 │   ├── test_Day3.py           # PagedAttention 测试
 │   └── test_Day4.py           # 融合 Linear 测试
-└── experiments/               # 📖 分步实验指南（8 篇，推荐阅读顺序）
-    ├── Day0-重温准备与架构总览.md
-    ├── Day1-数据结构层.md
-    ├── Day2-模型组件层.md
-    ├── Day3-PagedAttention引擎.md
-    ├── Day4-Qwen3模型与权重加载.md
-    ├── Day5-调度器与ModelRunner.md
-    ├── Day6-推理链路.md
-    └── Day7-进阶优化与总结.md
+└── experiments/               # 📖 分步实验指南（15 篇）
+    ├── Day0-架构总览与上手准备.md      # ┐
+    ├── Day1-数据结构层.md              # │
+    ├── Day2-模型组件层.md              # │ 主线：逐层读透
+    ├── Day3-PagedAttention引擎.md      # │ 现有实现并改进，
+    ├── Day4-Qwen3模型与权重加载.md     # │ 可运行验证
+    ├── Day5-调度器与ModelRunner.md     # │
+    ├── Day6-推理链路.md                # ┘
+    ├── Day7-进阶优化与总结.md          # ┐
+    ├── Day8-Chunked-Prefill与v1调度策略.md          # │
+    ├── Day9-Radix-Prefix-Cache与可观测指标.md       # │ 进阶：设计篇，
+    ├── Day10-Speculative-Decoding基础版.md          # │ 给完整设计与
+    ├── Day11-MoE推理主线与专家并行认知篇.md         # │ 代码，需自行
+    ├── Day11A-MoE单卡Expert-Offloading实验篇.md     # │ 落地并验证
+    ├── Day12-KV-Cache量化（int8模拟）.md             # │
+    └── Day13-CPU-KV-Block-Offload.md         # ┘
 ```
 
 ---
@@ -217,14 +224,19 @@ store_kvcache_kernel[grid](...)  # 每个 program 处理一个 token
 
 ## 🧪 实验指南（experiments/）
 
-本仓库配有 8 篇实验指南，帮助你在三个月断档后快速回忆并深入理解 nano-vLLM 的全部实现。
+本仓库配有 15 篇实验指南，带你把 nano-vLLM 的每一层读透、改稳。
 
-每篇指南包含：**知识点讲解 → 已有代码回顾 → 问题诊断 → 完整代码 → 验证步骤**。
+每篇的结构一致：**知识点讲解 → 这一层长什么样 → 这一版的薄弱处 → 完整代码 → 验证步骤**。
+
+两卷的读法不同，读之前先分清：
+
+- **Day0-Day6（主线）**：逐层读透现有实现，找出薄弱处并动手补上，每篇改完都能用 `example.py` 与 `tests/` 立刻验证。
+- **Day7-Day13 含 Day11A（进阶）**：CUDA Graph、Chunked Prefill、Radix Cache、投机解码、MoE、量化、Offload。给的是完整设计与代码，需要你亲手落地，再按各篇"验收命令"验证；其中 Day11A 的测试与 demo 在纯 CPU 上就能跑通（见该篇 §8/§9）。进阶篇依赖关系：Day7→Day4/5，Day8→Day4/5/6，Day10→Day4/8，Day11A→Day11（各篇开头有"前置依赖"框）。
 
 ### 推荐阅读顺序
 
 ```
-Day0 重温准备与架构总览  ← 从这里开始，帮你快速回忆
+Day0 架构总览与上手准备  ← 从这里开始，看清全局
  ↓
 Day3 PagedAttention 引擎  ← 最重要的模块，先读！
  ↓
@@ -245,14 +257,21 @@ Day7 进阶优化与总结       ← CUDA Graph / TP / 知识图谱
 
 | 篇目 | 文件 | 主题 | 关键收获 |
 |:---:|------|------|---------|
-| Day0 | `Day0-重温准备与架构总览.md` | 架构总览、数据流图 | 看清全局：请求从进入到输出的完整路径 |
+| Day0 | `Day0-架构总览与上手准备.md` | 架构总览、数据流图 | 看清全局：请求从进入到输出的完整路径 |
 | Day1 | `Day1-数据结构层.md` | Config / SamplingParams / Sequence / Context | 理解状态机、全局 Context 模式、PagedAttention 的 block_table 预留 |
 | Day2 | `Day2-模型组件层.md` | RMSNorm / SwiGLU / RoPE / 融合 Linear | 掌握 weight_loader 协议、QKV 融合原理、RoPE 旋转数学 |
 | Day3 | `Day3-PagedAttention引擎.md` | Block / BlockManager / Attention | **核心**：理解分页 KV Cache、Prefix Cache、Triton 写入、FlashAttention 双模式 |
 | Day4 | `Day4-Qwen3模型与权重加载.md` | Qwen3 完整模型 + safetensors 加载 | GQA 原理、packed_modules_mapping 映射协议、forward/logits 分离 |
 | Day5 | `Day5-调度器与ModelRunner.md` | Scheduler / ModelRunner | Continuous Batching 双队列、Prefill vs Decode 输入准备的差异 |
 | Day6 | `Day6-推理链路.md` | Sampler / LLMEngine / example.py | Gumbel-Max 采样、generate 循环、tqdm 吞吐监控 |
-| Day7 | `Day7-进阶优化与总结.md` | CUDA Graph / TP / 知识图谱 | 进阶方向、面试高频问题、项目知识图谱 |
+| Day7 | `Day7-进阶优化与总结.md` | CUDA Graph / TP / 知识图谱 | 进阶方向、面试高频问题、项目知识图谱（设计篇，需自行落地；依赖 Day4/5） |
+| Day8 | `Day8-Chunked-Prefill与v1调度策略.md` | 长 prompt 分块 prefill | chunk 账本、分页前缀 attention（设计篇，需自行落地；依赖 Day4/5/6） |
+| Day9 | `Day9-Radix-Prefix-Cache与可观测指标.md` | prefix tree 缓存 | hash 表 → 前缀树、命中率观测（设计篇，需自行落地） |
+| Day10 | `Day10-Speculative-Decoding基础版.md` | 投机解码 | draft/verify、greedy 精确匹配的 accept/reject（设计篇，需自行落地；依赖 Day4/8） |
+| Day11 | `Day11-MoE推理主线与专家并行认知篇.md` | MoE FFN | router/expert dispatch、专家并行认知（设计篇，需自行落地） |
+| Day11A | `Day11A-MoE单卡Expert-Offloading实验篇.md` | expert offloading | CPU master + GPU slot + LRU/pin（设计篇，需自行落地；依赖 Day11，自带 CPU 测试可直接跑） |
+| Day12 | `Day12-KV-Cache量化（int8模拟）.md` | KV cache 量化 | int8 对称量化模拟，真 FP8 只做原理讲解（设计篇，需自行落地） |
+| Day13 | `Day13-CPU-KV-Block-Offload.md` | CPU KV swap | KV block 换入换出（设计篇，需自行落地） |
 
 ### 当前代码已知问题（Day1-Day6 会修复）
 
@@ -261,8 +280,6 @@ Day7 进阶优化与总结       ← CUDA Graph / TP / 知识图谱
 3. **`Qwen3ForCausalLM.forward()` 直接返回 logits** — 在 Day4 拆分为 `forward() + compute_logits()`
 4. **`ModelRunner.run()` 没有 `reset_context()`** — 在 Day5 修复
 5. **`LLMEngine.step()` 的 prefill token 统计不准** — 在 Day6 修复
-
-> **注意**：旧的 `plans/` 目录已移至 `plans_archive/`。新旧指南有不兼容的差异，请只跟随 `experiments/` 中的指南。
 
 ---
 
@@ -288,11 +305,14 @@ Day7 进阶优化与总结       ← CUDA Graph / TP / 知识图谱
 | Qwen3 | `models/qwen3.py` | GQA + Q/K Norm + 融合权重映射 |
 | Loader | `utils/loader.py` | safetensors → 融合权重分发 |
 
-### 实验指南覆盖的进阶主题（Day7）
+### 实验指南覆盖的进阶主题（Day7-Day13）
 
-- **CUDA Graph** — decode 阶段录制计算图，消除 kernel launch 开销
-- **Tensor Parallel** — 多卡权重切分与 all_reduce 通信
-- **Chunked Prefill** — 长 prompt 分块处理的调度策略
+- **CUDA Graph**（Day7）— decode 阶段录制计算图，消除 kernel launch 开销
+- **Tensor Parallel**（Day7）— 多卡权重切分与 all_reduce 通信
+- **Chunked Prefill**（Day8）— 长 prompt 分块处理的调度策略与分页前缀 attention
+- **Radix Prefix Cache**（Day9）、**Speculative Decoding**（Day10）、**MoE 与 expert offloading**（Day11/11A）、**KV cache int8 量化模拟**（Day12）、**CPU KV swap**（Day13）
+
+这几篇都是设计篇：完整设计与代码在 `experiments/` 指南里，需要你亲手落地到源码，再按各篇验收命令验证。
 
 ## 性能参考
 

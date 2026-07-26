@@ -4,11 +4,11 @@
 
 这 4 个文件是整个项目的「骨架」。它们不涉及 GPU 计算，不涉及模型，只是**定义数据如何组织、配置如何管理、状态如何流转**。
 
-三个月前你已经写完了基础版本。本篇帮你在回忆的同时，**把当初留的几个坑填上**。
+这一层的代码已经能跑，但留着几个坑。本篇一边把每个数据结构读透，一边**把这些坑逐个填上**。
 
 ---
 
-## 1. 📖 知识点：为什么这四个类要这样设计？
+## 1. 知识点：为什么这四个类要这样设计？
 
 ### 1.1 Config — 一个数据中心，不是配置文件的搬运工
 
@@ -61,7 +61,7 @@ Attention.forward()  ←──  ctx = get_context()  ←────────
 
 ---
 
-## 2. 🔍 已有代码回顾
+## 2. 这一层现在长什么样
 
 ### 2.1 `config.py` — 当前状态
 
@@ -111,7 +111,7 @@ ignore_eos: bool = False    # 是否忽略 EOS
 
 ---
 
-## 3. ⚠️ 当前问题分析
+## 3. 这一版的薄弱处
 
 ### 问题 1：Config 缺少 property
 
@@ -144,8 +144,8 @@ Sequence 目前只复制了 `temperature`、`max_tokens`、`ignore_eos`。需要
 
 当前代码：
 ```python
-max_context_len: int = None   # ⚠️ None 不是 int
-max_num_blocks: int = None    # ⚠️ None 不是 int
+max_context_len: int = None   # None 不是 int
+max_num_blocks: int = None    # None 不是 int
 ```
 
 `int = None` 在类型检查器（mypy / pyright）中会报错，因为 `None` 不是 `int` 的合法值。应改为：
@@ -158,7 +158,7 @@ max_num_blocks: int | None = None
 
 ---
 
-## 4. 📝 完善后的完整代码
+## 4. 完善后的完整代码
 
 ### 4.1 `config.py`（完善版）
 
@@ -678,9 +678,9 @@ class Sequence:
         self.num_tokens += 1
 ```
 
-### 4.4 `utils/context.py`（不需要改，但建议复习）
+### 4.4 `utils/context.py`（应用问题 5 的注解修复）
 
-当前代码已经完整，不需要修改。但需要理解它的设计：
+这一版逻辑上已经完整，唯一要动的就是 §3 问题 5 指出的两处类型注解（`max_context_len` / `max_num_blocks` 改为 `int | None`）。下面的完整代码**已包含该修复**，同时需要理解它的设计：
 
 ```python
 """
@@ -741,8 +741,8 @@ class Context:
     # ═══ Decode 阶段参数 ═══
     context_lens: torch.Tensor | None = None   # [num_seqs] 每条序列的上下文长度
     block_tables: torch.Tensor | None = None   # [num_seqs, max_blocks] 所有序列的块表
-    max_context_len: int = None                # 最大上下文长度
-    max_num_blocks: int = None                 # 最大块数
+    max_context_len: int | None = None         # 最大上下文长度（问题 5 修复：int | None）
+    max_num_blocks: int | None = None          # 最大块数（问题 5 修复：int | None）
 
     # ═══ KV Cache 引用 ═══
     # [num_layers] 每层一个 tensor
@@ -792,7 +792,7 @@ def clear_context():
 
 ---
 
-## 5. ✅ 验证步骤
+## 5. 验证步骤
 
 ```bash
 cd nano_vll_repro
@@ -809,7 +809,7 @@ sp = SamplingParams(temperature=0.0, top_k=20, top_p=0.95)
 print(f"temperature={sp.temperature}, top_k={sp.top_k}, top_p={sp.top_p}")
 assert sp.temperature == 0.0
 assert sp.top_k == 20
-print("✅ SamplingParams 测试通过")
+print("SamplingParams 测试通过")
 PY
 
 # 3. 快速手测 Sequence 采样参数复制
@@ -824,26 +824,26 @@ assert seq.temperature == 0.7
 assert seq.top_k == 8
 assert seq.top_p == 0.9
 assert seq.max_tokens == 64
-print("✅ Sequence 采样参数复制测试通过")
+print("Sequence 采样参数复制测试通过")
 PY
 
 # 4. 跑 Day1 测试
 python tests/test_Day1.py
 ```
 
-> **⚠️ 现有 `tests/test_Day1.py` 有以下 bug，需要先修复再运行：**
+> **`tests/test_Day1.py` 有两个容易写错的地方，错误写法与修正写法对照如下：**
 >
-> **Bug 1**：`test_context()` 中 `set_context()` 传参方式错误（第 115-122 行、第 132-136 行）。
-> `set_context()` 只接受一个 `Context` 对象，不接受裸关键字参数。修复：
+> **易错点 1**：`test_context()` 中 `set_context()` 的传参方式。
+> `set_context()` 只接受一个 `Context` 对象，不接受裸关键字参数：
 > ```python
-> # ❌ 错误（当前代码）
+> # 错误写法
 > set_context(
 >     is_prefill=True,
 >     cu_seqlens_q=torch.tensor([0, 4, 6, 11], dtype=torch.int32),
 >     ...
 > )
 >
-> # ✅ 正确
+> # 正确
 > from utils.context import Context  # 确保顶部有这个导入
 > set_context(Context(
 >     is_prefill=True,
@@ -851,14 +851,14 @@ python tests/test_Day1.py
 >     ...
 > ))
 > ```
-> 第 132-136 行同理，把 `set_context(is_prefill=False, ...)` 改为 `set_context(Context(is_prefill=False, ...))`。
+> decode 场景的调用同理，`set_context(is_prefill=False, ...)` 要写成 `set_context(Context(is_prefill=False, ...))`。
 >
-> **Bug 2**：`test_config()` 中 `Config()` 参数名错误（第 160 行）。
+> **易错点 2**：`test_config()` 中 `Config()` 的参数名。
 > ```python
-> # ❌ 错误（当前代码）
+> # 错误写法
 > config = Config(model="models/Qwen3-0.6B")
 >
-> # ✅ 正确
+> # 正确
 > config = Config(model_path="models/Qwen3-0.6B")
 > ```
 > `Config` 的字段名是 `model_path`，`model` 只是一个只读 property 别名，不能作为构造参数。
@@ -876,4 +876,4 @@ python tests/test_Day1.py
 
 ---
 
-下一篇：**Day2 — 模型组件层**（RMSNorm / SwiGLU / RoPE / 融合 Linear 的已有代码回顾与完善）
+下一篇：**Day2 — 模型组件层**（RMSNorm / SwiGLU / RoPE / 融合 Linear，逐个读透与改进）

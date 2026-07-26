@@ -4,7 +4,7 @@
 
 第一，**复用路径不透明。** 命中了多少次？复用了多少 token？哪些块是共享的？一问三不知。代码看起来支持 prefix cache，实际可能从来没命中过——没有指标，你根本没法判断。
 
-第二，**hash 表是扁平的。** 它只知道”这个 hash 出现过”，不知道”这个前缀下面还能接哪些块”。前缀共享的树形结构被压成了一张平面表。
+第二，**hash 表是扁平的。** 它只知道“这个 hash 出现过”，不知道“这个前缀下面还能接哪些块”。前缀共享的树形结构被压成了一张平面表。
 
 这次做两件事：在 hash 之上叠一棵 prefix tree，把前缀共享结构显式化；同时加上命中/复用指标，让 prefix cache 的效果可观测。KV cache tensor 布局、Triton kernel、attention 协议都不碰。
 
@@ -12,23 +12,23 @@
 
 ## 1. 当前 hash prefix cache 的两个限制
 
-`engine/block_manager.py` 里的 prefix cache 思路是：只有完整块才算 hash，hash 链入 `prefix_hash` 保证”相同前缀 + 相同内容”才命中，命中后复用整个物理块。
+`engine/block_manager.py` 里的 prefix cache 思路是：只有完整块才算 hash，hash 链入 `prefix_hash` 保证“相同前缀 + 相同内容”才命中，命中后复用整个物理块。
 
 比没有 prefix cache 强很多，但：
 
 ### 1.1 只能按完整块边界命中
 
-两条序列的长前缀高度重合，但尾部重合不够一个完整 block——hash 表无法表达”部分尾块复用”。这次先不做 partial-tail 复用，但把前缀结构显式化，为后续扩展留边界。
+两条序列的长前缀高度重合，但尾部重合不够一个完整 block——hash 表无法表达“部分尾块复用”。这次先不做 partial-tail 复用，但把前缀结构显式化，为后续扩展留边界。
 
 ### 1.2 复用路径不透明
 
 命中逻辑能工作，但你回答不了这些问题：命中了多少次？复用了多少 token？哪些块是共享的？cache 的前缀覆盖长什么样？
 
-prefix tree 的价值就在这里：它不只是”能不能命中”的映射表，而是能表达”前缀共享结构”的数据结构。
+prefix tree 的价值就在这里：它不只是“能不能命中”的映射表，而是能表达“前缀共享结构”的数据结构。
 
 ---
 
-## 2. 当前代码的三个相关点
+## 2. 与本篇相关的三处代码
 
 ### 2.1 `BlockManager` 里只有 `hash_to_block_id`
 
@@ -36,11 +36,11 @@ prefix tree 的价值就在这里：它不只是”能不能命中”的映射�
 self.hash_to_block_id: dict[int, int] = {}
 ```
 
-适合回答”这个完整块 hash 有没有出现过”，但表达不了：某个前缀下面还能接哪些块、前缀树的深度和分支、一条序列沿着哪条共享路径匹配上。
+适合回答“这个完整块 hash 有没有出现过”，但表达不了：某个前缀下面还能接哪些块、前缀树的深度和分支、一条序列沿着哪条共享路径匹配上。
 
 ### 2.2 `Sequence` 已经有 `num_cached_tokens`
 
-后面继续用它做”这条序列复用了多少前缀 token”的总账本。
+后面继续用它做“这条序列复用了多少前缀 token”的总账本。
 
 ### 2.3 没有显式的 observability 对象
 
@@ -53,7 +53,7 @@ self.hash_to_block_id: dict[int, int] = {}
 1. 块级 hash 保留。
 2. 在 hash 之上叠一棵 prefix tree。
 3. 每个树节点代表一个已填满、已算出 hash 的完整块。
-4. 父子关系代表”某个块在某个前缀之后继续延伸”。
+4. 父子关系代表“某个块在某个前缀之后继续延伸”。
 5. 复用时沿树 + hash 索引找稳定完整块。
 6. 同时统计 prefix cache 观测指标。
 
@@ -252,7 +252,7 @@ def allocate(self, seq: Sequence):
 
 ### 4.6 替换 `append_slot()`
 
-decode 或 chunked prefill 可能让末尾块在某一刻刚好填满。`append_slot()` 在”当前块刚好填满”时也要把它挂进 prefix tree：
+decode 或 chunked prefill 可能让末尾块在某一刻刚好填满。`append_slot()` 在“当前块刚好填满”时也要把它挂进 prefix tree：
 
 ```python
 def append_slot(self, seq: Sequence):
@@ -313,7 +313,7 @@ def reset_prefix_cache_stats(self) -> None:
 
 看起来变化不小，但故意没碰这些稳定边界：
 
-1. `Sequence.block_table` 仍然是”逻辑块 → 物理块”的映射。
+1. `Sequence.block_table` 仍然是“逻辑块 → 物理块”的映射。
 2. `slot_mapping` 的计算方式不变。
 3. `Attention` 仍然只关心 `slot_mapping` 和 `kv_cache`。
 4. `Scheduler` 仍然只和 `allocate / can_append / deallocate` 打交道。
@@ -433,8 +433,8 @@ PY
 
 ## 8. 常见坑
 
-1. **把 radix tree 理解成”任意 token 级压缩 trie”，试图重写整个 KV cache 地址体系。** 完全不需要。当前只做完整块级前缀树。
-2. **删掉 hash 检查，只留 tree。** 快速命中索引能力会变差。最稳的是”tree 表达结构，hash 做快速索引”。
+1. **把 radix tree 理解成“任意 token 级压缩 trie”，试图重写整个 KV cache 地址体系。** 完全不需要。当前只做完整块级前缀树。
+2. **删掉 hash 检查，只留 tree。** 快速命中索引能力会变差。最稳的是“tree 表达结构，hash 做快速索引”。
 3. **最后一个不完整块也注册进 prefix cache。** 不稳定尾块会被错误复用。
 4. **只做复用，不做观测指标。** 你根本不知道 prefix cache 到底有没有起作用。
 5. **把 prefix tree 节点塞进 `Sequence` 里长期保存。** 没必要让序列持有这么重的状态；统计和复用逻辑都放 `BlockManager`。
@@ -443,9 +443,9 @@ PY
 
 ## 9. 读完你应该明白
 
-prefix cache 的升级重点不只是”再快一点”，而是”更准确地表达前缀共享结构”。当前仓库最适合的路径是在现有 block/hash 体系上叠 prefix tree，不是改 KV cache tensor 布局。observability 不是附属品——没有指标，你判断不了 prefix cache 是否真的有价值。
+prefix cache 的升级重点不只是“再快一点”，而是“更准确地表达前缀共享结构”。当前仓库最适合的路径是在现有 block/hash 体系上叠 prefix tree，不是改 KV cache tensor 布局。observability 不是附属品——没有指标，你判断不了 prefix cache 是否真的有价值。
 
-做完这一步，后面的 speculative decoding、MoE、offload 才更容易建立在”看得见账本”的推理系统上。
+做完这一步，后面的 speculative decoding、MoE、offload 才更容易建立在“看得见账本”的推理系统上。
 
 下一篇：`Day10-Speculative-Decoding基础版.md`。
 

@@ -9,7 +9,7 @@
 
 ---
 
-## 1. 📖 知识点：采样策略
+## 1. 知识点：采样策略
 
 ### 1.1 三种采样方式的递进关系
 
@@ -67,49 +67,50 @@ safe_temps[greedy_mask] = 1.0  # 临时设为1.0，避免除零
 
 ---
 
-## 2. 🔍 已有代码回顾
+## 2. 这一层现在长什么样
 
 ### 2.1 Sampler（`layers/sampler.py`）
 
-当前已有的实现：
-- ✅ 使用 Gumbel-Max Trick 采样
-- ✅ 处理 temperature=0 的 greedy 情况
-- ✅ 使用 `@torch.compile` 做 JIT 加速
-- ❌ **不支持 top_k 和 top_p**——`forward()` 签名只有 `(logits, temperatures)`
+已实现：
+- 使用 Gumbel-Max Trick 采样
+- 处理 temperature=0 的 greedy 情况
+- 使用 `@torch.compile` 做 JIT 加速
+
+缺失：**不支持 top_k 和 top_p**——`forward()` 签名只有 `(logits, temperatures)`
 
 ### 2.2 LLMEngine（`engine/llm_engine.py`）
 
-当前已有：
-- ✅ 完整的 `generate()` 循环
-- ✅ tqdm 进度条和吞吐监控
-- ❌ **prefill token 统计不准**：`num_tokens = sum(len(seq) for seq in seqs)` 这行把整条 prompt 长度算进去了，没有减去已缓存的 prefix token
+已实现：
+- 完整的 `generate()` 循环
+- tqdm 进度条和吞吐监控
+
+缺陷：**prefill token 统计不准**——`num_tokens = sum(len(seq) for seq in seqs)` 这行把整条 prompt 长度算进去了，没有减去已缓存的 prefix token
 
 ### 2.3 SamplingParams（`sampling_params.py`）
 
-当前已有：
-- ❌ 拒绝 `temperature=0`（`assert self.temperature > 1e-10`）
-- ❌ 没有 `top_k` / `top_p` 字段
+两个缺口：
+- 拒绝 `temperature=0`（`assert self.temperature > 1e-10`）
+- 没有 `top_k` / `top_p` 字段
 
 ### 2.4 Sequence（`engine/sequence.py`）
 
-当前已有：
-- ❌ 没有复制 `top_k` / `top_p` 到 Sequence
+缺口：没有复制 `top_k` / `top_p` 到 Sequence
 
 ---
 
-## 3. ⚠️ 当前问题分析
+## 3. 这一版的薄弱处
 
 | 问题 | 严重度 | 影响 |
 |------|--------|------|
-| SamplingParams 不支持 top_k/top_p | 🔴 高 | 用户无法控制生成多样性 |
-| Sequence 没有 top_k/top_p | 🔴 高 | ModelRunner 拿不到采样参数 |
-| Sampler.forward() 不接受 top_k/top_p | 🔴 高 | 采样策略只能用 temperature |
-| temperature=0 被拒绝 | 🟡 中 | 无法用 greedy decoding |
-| prefill token 统计包含了 cached tokens | 🟡 中 | 吞吐量指标偏大（不影响推理正确性） |
+| SamplingParams 不支持 top_k/top_p | 高 | 用户无法控制生成多样性 |
+| Sequence 没有 top_k/top_p | 高 | ModelRunner 拿不到采样参数 |
+| Sampler.forward() 不接受 top_k/top_p | 高 | 采样策略只能用 temperature |
+| temperature=0 被拒绝 | 中 | 无法用 greedy decoding |
+| prefill token 统计包含了 cached tokens | 中 | 吞吐量指标偏大（不影响推理正确性） |
 
 ---
 
-## 4. 📝 完善后的代码
+## 4. 完善后的代码
 
 ### 4.1 完善 `sampling_params.py`
 
@@ -540,7 +541,7 @@ class LLMEngine:
         ]
 
         # ── 步骤5: token 统计 ──
-        # FIXED: prefill 阶段只统计「新计算的」token
+        # prefill 阶段只统计「新计算的」token
         # 原来写的是 sum(len(seq) for seq in seqs)，把已缓存的 prefix token 也算进去了
         if is_prefill:
             num_tokens = sum(
@@ -797,20 +798,20 @@ print(f"旧接口输出: {tokens}")
 
 # 测试2: greedy（temperature=0）→ argmax
 assert tokens[0] == logits[0].argmax(), "temperature=0 应该是 greedy!"
-print("✅ greedy (temperature=0) 验证通过")
+print("greedy (temperature=0) 验证通过")
 
 # 测试3: 新接口 — top_k 过滤
 top_ks = torch.tensor([0, 5, 10])
 top_ps = torch.tensor([1.0, 1.0, 0.9])
 tokens = sampler(logits, temps, top_ks, top_ps)
 print(f"新接口输出: {tokens}")
-print("✅ top_k/top_p 测试通过")
+print("top_k/top_p 测试通过")
 
 # 测试4: top_k=0 → 不过滤 → 和不用 top_k 结果一致
 tokens_no_topk = sampler(logits, temps)
 tokens_topk0 = sampler(logits, temps, torch.zeros_like(temps))
 assert torch.equal(tokens_no_topk, tokens_topk0), "top_k=0 不应影响结果"
-print("✅ top_k=0 (不启用) 验证通过")
+print("top_k=0 (不启用) 验证通过")
 PY
 ```
 

@@ -8,7 +8,7 @@
 
 ---
 
-## 1. 📖 知识点讲解
+## 1. 知识点讲解
 
 ### 1.1 传统 KV Cache 管理的问题
 
@@ -65,7 +65,7 @@ PagedAttention: 内存被切成固定大小的页，按需分配，可以不连�
 - **零外部碎片**：物理页可以任意分配，不需要连续空间
 - **前缀共享**：两个请求的 prompt 相同部分可以指向同一个物理页，只需引用计数 +1
 
-### 1.3 五个关键数据结构（复习）
+### 1.3 五个关键数据结构
 
 | 概念 | 在代码中的位置 | 作用 |
 |------|-------------|------|
@@ -143,49 +143,27 @@ def allocate(seq):
 
 ---
 
-## 2. 🔍 已有代码回顾
+## 2. 这一层现在长什么样
+
+两份文件的完整代码在 §4 逐行注释给出，这里只列要点帮你恢复记忆，不重复贴代码。
 
 ### 2.1 Block（`engine/block_manager.py`）— 已有实现
 
-```python
-class Block:
-    """物理内存块"""
-    def __init__(self, block_id: int):
-        self.block_id = block_id      # 物理页编号
-        self.ref_count = 0            # 引用计数（多少序列在用这个块）
-        self.hash = -1                # 内容哈希（-1 表示未完成/无效）
-        self.token_ids = []           # 存储的 token ID（用于 Prefix Cache 验证）
+一个物理页对象，四个字段、两个方法（完整定义见 §4.1 的 `class Block`）：
 
-    def update(self, hash_value, token_ids):
-        """块填满时更新哈希和内容"""
-        self.hash = hash_value
-        self.token_ids = token_ids
-
-    def reset(self):
-        """重新分配时重置"""
-        self.ref_count = 1
-        self.hash = -1
-        self.token_ids = []
-```
-
-**设计要点**：
-- `ref_count`：支持多个序列共享同一个物理块（Prefix Cache 的核心）。只有引用计数归零时才真正释放。
-- `hash = -1`：用 -1 表示「未被完整填充的块」——没有有效哈希的块不能用于 Prefix Cache。
-- `token_ids`：存储原始 token ID 列表，用于**验证**哈希匹配后确实内容相同（防止哈希碰撞）。
+- `block_id`：物理页编号（在 kv_cache tensor 中的索引）
+- `ref_count`：引用计数——多少序列在用这个块，只有归零才真正释放。这是 Prefix Cache 共享的核心。
+- `hash`：内容哈希，`-1` 表示「未被完整填充」——没有有效哈希的块不能用于 Prefix Cache
+- `token_ids`：原始 token 列表，用于**验证**哈希匹配后确实内容相同（防止哈希碰撞）
+- `update(hash, token_ids)` 在块填满时记录内容；`reset()` 在重新分配时清空并把 `ref_count` 置 1
 
 ### 2.2 BlockManager（`engine/block_manager.py`）— 已有实现
 
-BlockManager 有三个关键的内部方法，它们的区别需要搞清楚：
+三个内部方法的区别需要搞清楚（§4.1 的类 docstring 里也有这段对比）：
 
-```python
-# 方法 1：_allocate_fresh_block() — 从空闲池头部取新块，彻底清空
-
-# 方法 2：_recover_block(block_id) — 复活空闲池中的一个指定块，保留其哈希和内容
-#   （用于 Prefix Cache 命中：这个块之前被某序列用过，现在空闲了，但内容还在）
-
-# 方法 3：_deallocate_block(block_id) — 释放块回空闲池
-#   （引用计数归零时调用）
-```
+1. `_allocate_fresh_block()` — 从空闲池头部取新块，彻底清空（Cache Miss 用）
+2. `_recover_block(block_id)` — 复活空闲池中的指定块，保留其哈希和内容（Cache Hit 用：这个块之前被某序列用过，现在空闲了，但内容还在）
+3. `_deallocate_block(block_id)` — 引用计数归零时释放块回空闲池
 
 三个方法的协作关系：
 ```
@@ -202,32 +180,7 @@ BlockManager 有三个关键的内部方法，它们的区别需要搞清楚：
 
 ### 2.3 store_kvcache Triton Kernel（`layers/attention.py`）— 已有实现
 
-```python
-@triton.jit
-def store_kvcache_kernel(
-    K, V, KCache, VCache, slot_mapping,
-    stride_kn, stride_kh, stride_kd,     # K 张量的 stride
-    stride_vn, stride_vh, stride_vd,     # V 张量的 stride
-    stride_kcb, stride_kcs, stride_kch, stride_kcd,  # KCache 的 stride
-    stride_vcb, stride_vcs, stride_vch, stride_vcd,  # VCache 的 stride
-    num_heads, head_dim, block_size,
-    BLOCK_H, BLOCK_D                     # Triton 分块计算参数
-):
-    """每个 program 处理一个 token，将其 K/V 写入 Cache 的指定 slot"""
-    token_idx = tl.program_id(0)         # 我是第几个 token
-    slot = tl.load(slot_mapping + token_idx)  # 从 slot_mapping 读取目标位置
-
-    block_id = slot // block_size        # 目标物理页编号
-    block_offset = slot % block_size     # 页内偏移
-
-    # 遍历所有 head 和 head_dim，分块加载/存储
-    for h in range(0, num_heads, BLOCK_H):
-        for d in range(0, head_dim, BLOCK_D):
-            k = tl.load(K + ...)         # 从输入 K 读取
-            v = tl.load(V + ...)         # 从输入 V 读取
-            tl.store(KCache + ..., k)    # 写入 KV Cache 的 K 部分
-            tl.store(VCache + ..., v)    # 写入 KV Cache 的 V 部分
-```
+kernel 的完整实现见 §4.2，逻辑一句话能说清：**grid 按 token 划分，每个 program 处理一个 token**——从 `slot_mapping` 读出目标槽位，换算 `block_id = slot // block_size` 和页内偏移，然后按 `BLOCK_H × BLOCK_D` 分块把这个 token 的 K/V 拷进 KCache/VCache。
 
 **为什么用 Triton kernel 而不是 PyTorch 原生索引？**
 
@@ -235,48 +188,16 @@ PyTorch 的 `kv_cache[slot_mapping] = k` 看似简单，但涉及 GPU 上的 sca
 
 ### 2.4 Attention 类（`layers/attention.py`）— 已有实现
 
-```python
-class Attention(nn.Module):
-    def forward(self, q, k, v):
-        # 步骤1: 无论 prefill 还是 decode，先存入 KV Cache
-        if context.slot_mapping is not None:
-            store_kvcache(k, v, context.kv_cache[self.layer_idx], context.slot_mapping)
+`forward(q, k, v)` 的执行顺序（完整代码见 §4.2）：
 
-        # 步骤2: 根据阶段选择不同的 FlashAttention API
-        if context.is_prefill:
-            return self._prefill_attention(q, k, v, context)
-        else:
-            return self._decode_attention(q, context)
-            # 注意：decode 时不传 k, v，因为 K/V 已经从 cache 读取
-
-    def _prefill_attention(self, q, k, v, context):
-        return flash_attn_varlen_func(
-            q=q, k=k, v=v,
-            cu_seqlens_q=context.cu_seqlens_q,
-            cu_seqlens_k=context.cu_seqlens_k,
-            max_seqlen_q=context.max_seqlen_q,
-            max_seqlen_k=context.max_seqlen_k,
-            softmax_scale=self.scale,
-            causal=True,
-        )
-
-    def _decode_attention(self, q, context):
-        k_cache = context.kv_cache[self.layer_idx][0]  # K cache
-        v_cache = context.kv_cache[self.layer_idx][1]  # V cache
-        return flash_attn_with_kvcache(
-            q=q.unsqueeze(1),  # [num_seqs, num_heads, head_dim] → [num_seqs, 1, num_heads, head_dim]
-            k_cache=k_cache,
-            v_cache=v_cache,
-            cache_seqlens=context.context_lens,
-            block_table=context.block_tables,
-            softmax_scale=self.scale,
-            causal=True,
-        ).squeeze(1)
-```
+1. **先写 cache**：无论 prefill 还是 decode，都先调 `store_kvcache` 把当前 K/V 写入 `context.kv_cache[self.layer_idx]` 的指定槽位
+2. **再算 attention**，按阶段分流：
+   - Prefill → `flash_attn_varlen_func(q, k, v, cu_seqlens_q/k, ...)`，靠 `cu_seqlens` 标记变长序列的边界
+   - Decode → `flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache, cache_seqlens, block_table, ...)`——注意不传 k、v，历史 K/V 全部从 cache 读取，靠 `block_tables` 定位物理页
 
 ---
 
-## 3. ⚠️ 当前代码的问题分析
+## 3. 这一版的三个薄弱处
 
 BlockManager 和 Attention 的代码已经比较完整。主要的问题在于：
 
@@ -286,13 +207,13 @@ BlockManager 和 Attention 的代码已经比较完整。主要的问题在于�
 
 3. **BlockManager 的 `_recover_block` 使用的是 `list.remove()`**：时间复杂度 O(n)，在大规模场景下可能有性能影响。但对于教学项目足够。
 
-4. **🔴 `block_manager.py` 第 298 行 Off-by-One 错误**：Prefix Cache 链式哈希的条件判断有误。
+4. **`block_manager.py` 第 298 行 Off-by-One 错误**：Prefix Cache 链式哈希的条件判断有误。
 
 ```python
-# ❌ 当前代码（第 298 行）
+# 当前代码（第 298 行）
 prefix_hash = self.blocks[block_table[-2]].hash if len(block_table) > 2 else -1
 
-# ✅ 正确应为
+# 正确应为
 prefix_hash = self.blocks[block_table[-2]].hash if len(block_table) >= 2 else -1
 ```
 
@@ -309,9 +230,9 @@ prefix_hash = self.blocks[block_table[-2]].hash if len(block_table) >= 2 else -1
 
 ---
 
-## 4. 📝 完整代码
+## 4. 完整代码
 
-以下代码就是你当前 `engine/block_manager.py` 和 `layers/attention.py` 的完整内容。三个月没看，建议逐段阅读注释。
+以下是 `engine/block_manager.py` 和 `layers/attention.py` 的完整内容。这是全书最密的两个文件，建议逐段读注释，不要跳。
 
 ### 4.1 `engine/block_manager.py`
 
@@ -842,6 +763,17 @@ def store_kvcache_kernel(
             tl.store(vc_ptrs, v, mask=mask)
 
 
+# ── 架构差异说明 ──
+# 本教程的 KV Cache 采用合并存储：kv_cache: [2, num_blocks, block_size, num_kv_heads, head_dim]
+# 其中 dim=0 区分 K（索引 0）和 V（索引 1）。
+#
+# 上游 nano-vllm 采用分离存储：k_cache 和 v_cache 是两个独立的 tensor，
+# Attention 层持有 self.k_cache 和 self.v_cache 两个实例属性。
+#
+# 本教程选择合并存储是为了简化 Context 传递——只需传一个 kv_cache tensor，
+# 而非两个独立引用。两种设计在功能上等价，性能差异可忽略。
+# 如果你对照上游代码，注意这个结构差异。
+
 def store_kvcache(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1031,7 +963,7 @@ class Attention(nn.Module):
 
 ---
 
-## 5. ✅ 验证步骤
+## 5. 验证步骤
 
 ```bash
 cd nano_vll_repro
@@ -1040,18 +972,18 @@ cd nano_vll_repro
 python tests/test_Day3.py
 ```
 
-> **⚠️ 现有 `tests/test_Day3.py` 有以下 bug，需要先修复再运行：**
+> **`tests/test_Day3.py` 有两个容易踩的坑，错误写法与正确写法对照如下：**
 >
-> **Bug 1**：`test_attention_with_context()` 中 `set_context()` 传参方式错误（第 219-226 行）。
+> **易错点 1**：`test_attention_with_context()` 中 `set_context()` 的传参方式。
 > ```python
-> # ❌ 错误（当前代码）
+> # 错误写法
 > set_context(
 >     is_prefill=True,
 >     cu_seqlens_q=cu_seqlens,
 >     ...
 > )
 >
-> # ✅ 正确
+> # 正确
 > from utils.context import Context  # 确保顶部导入中包含 Context
 > set_context(Context(
 >     is_prefill=True,
@@ -1059,24 +991,37 @@ python tests/test_Day3.py
 >     ...
 > ))
 > ```
-> 同时需要在文件顶部的 import 中补上 `Context`：
+> 同时文件顶部的 import 需要包含 `Context`：
 > ```python
-> # 当前（第 10 行）
-> from utils.context import set_context, reset_context
-> # 改为
 > from utils.context import Context, set_context, reset_context
 > ```
 >
-> **Bug 2**：`test_store_kvcache()` 中 `store_kvcache()` 调用签名错误（第 262 行）。
-> ```python
-> # ❌ 错误（当前代码）— 传了分离的 k_cache, v_cache 两个参数
-> store_kvcache(key, value, k_cache, v_cache, slot_mapping)
+> **易错点 2**：`test_store_kvcache()` 中 `store_kvcache()` 的调用签名——容易写成传分离的 `k_cache, v_cache` 两个参数，而实际签名是 `(k, v, kv_cache, slot_mapping)`，`kv_cache` 是合并的 `[2, ...]` tensor。
 >
-> # ✅ 正确 — 应构造合并的 kv_cache tensor
-> kv_cache = torch.stack([k_cache, v_cache], dim=0)  # [2, num_blocks, block_size, num_kv_heads, head_dim]
+> **正确写法**（`tests/test_Day3.py` 采用的写法）：从一开始就分配合并布局的 cache，写入后直接对它的 K/V 两半切片断言：
+> ```python
+> # 与 ModelRunner.allocate_kv_cache 的真实布局一致
+> kv_cache = torch.zeros(2, num_blocks, block_size, num_kv_heads, head_dim).cuda()
+>
 > store_kvcache(key, value, kv_cache, slot_mapping)
+>
+> # 验证：直接对合并 cache 切片（kv_cache[0]/[1] 是视图，不是拷贝）
+> k_cache_flat = kv_cache[0].view(-1, num_kv_heads, head_dim)
+> v_cache_flat = kv_cache[1].view(-1, num_kv_heads, head_dim)
+> for i, slot in enumerate(slot_mapping.tolist()):
+>     assert torch.allclose(k_cache_flat[slot], key[i])
+>     assert torch.allclose(v_cache_flat[slot], value[i])
 > ```
-> `store_kvcache()` 的实际签名是 `(k, v, kv_cache, slot_mapping)`，`kv_cache` 是合并的 `[2, ...]` tensor。
+>
+> **一个看似等价、实则错误的写法**：先建分离的 `k_cache`、`v_cache`，临时 `torch.stack` 出合并 tensor 再传入：
+> ```python
+> # 错误：stack 产生的是拷贝，不是视图！
+> kv_cache = torch.stack([k_cache, v_cache], dim=0)
+> store_kvcache(key, value, kv_cache, slot_mapping)
+> # kernel 把 K/V 写进了 stack 出来的那份拷贝，
+> # 原始 k_cache / v_cache 仍然全零——后面的断言读到的全是 0。
+> ```
+> `torch.stack` 会分配一块新内存并复制数据，写入发生在拷贝上；要么自始至终用合并 tensor（推荐，与主线布局一致），要么断言时改读 stack 出来的那个 `kv_cache[0]/[1]`。
 
 如果看到 `🎉 Day 3 所有测试通过!`，说明 PagedAttention 引擎正常。
 
@@ -1107,7 +1052,7 @@ print(f"slot_mapping: {slots}")  # 例如 [0,1,2,3, 4,5,6]（取决于分配的�
 
 ---
 
-## 6. 📌 本篇核心记忆
+## 6. 本篇核心记忆
 
 三句话概括 PagedAttention：
 

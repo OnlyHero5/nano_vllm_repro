@@ -1,5 +1,7 @@
 # Day 7 — 进阶优化：CUDA Graph 与 Tensor Parallel 入门
 
+> **前置依赖**：本篇的 CUDA Graph 代码建立在 **Day4**（`forward()` 返回 hidden_states + `compute_logits()` 拆分）和 **Day5**（`ModelRunner.run_model()` 已拆出、`run()` 带 try/finally `reset_context()`）之上。仓库基线代码（`run()` 直接 `self.model(...)` 返回 logits）没有这些接口，先把 Day4/Day5 落地再来抄本篇。
+
 ## 本篇定位
 
 到 Day6 为止，你已经拥有了一个**完整的、可运行的单卡推理引擎**。本篇是「进阶加餐」，讲解两个实际 vLLM 中的核心优化技术：
@@ -47,8 +49,8 @@ GPU 做: MLP
 
 | 阶段 | 输入形状 | 适合 CUDA Graph？ |
 |------|---------|------------------|
-| Prefill | 每条序列的 prompt 长度不同，batch 组合每次变化 | ❌ 形状不固定 |
-| Decode | 每条序列只输入 1 个 token，batch_size 固定时形状完全一致 | ✅ 形状固定 |
+| Prefill | 每条序列的 prompt 长度不同，batch 组合每次变化 | 不适合，形状不固定 |
+| Decode | 每条序列只输入 1 个 token，batch_size 固定时形状完全一致 | 适合，形状固定 |
 
 ### 1.4 为什么 Sampler 不放进 Graph？
 
@@ -484,7 +486,7 @@ MergedLinear = ColumnParallelLinear    # Gate-Up 也是 Column Parallel
 RowLinear = RowParallelLinear
 ```
 
-> **⚠️ 重要兼容性警告**：
+> **重要兼容性警告**：
 >
 > 上面的别名替换**不能直接使用**，因为 `loader.py` 的 `packed_modules_mapping` 会这样调用：
 > ```python
@@ -677,18 +679,18 @@ PY
 
 | 特性 | 原版 nano-vLLM | 本复刻版本 |
 |------|---------------|-----------|
-| PagedAttention | ✅ | ✅ |
-| Continuous Batching | ✅ | ✅ |
-| Prefix Cache (hash) | ✅ | ✅ |
-| FlashAttention | ✅ | ✅ |
-| Triton KV Cache kernel | ✅ | ✅ |
-| CUDA Graph | ✅ | ✅ (Day7 教学版) |
-| Tensor Parallel | ✅ | ✅ (Day7 教学版) |
-| Chunked Prefill | ✅ | ❌ (进阶) |
-| Radix Prefix Cache | ✅ | ❌ (进阶) |
-| Speculative Decoding | ❌ | ❌ |
-| MoE | ❌ | ❌ |
-| FP8 量化 | ✅ | ❌ |
+| PagedAttention | 有 | 有 |
+| Continuous Batching | 有 | 有 |
+| Prefix Cache (hash) | 有 | 有 |
+| FlashAttention | 有 | 有 |
+| Triton KV Cache kernel | 有 | 有 |
+| CUDA Graph | 有 | 有 (Day7 教学版) |
+| Tensor Parallel | 有 | 有 (Day7 教学版) |
+| Chunked Prefill | 有 | 无 (进阶篇补) |
+| Radix Prefix Cache | 有 | 无 (进阶篇补) |
+| Speculative Decoding | 无 | 无 |
+| MoE | 无 | 无 |
+| FP8 量化 | 有 | 无 |
 
 ### 4.4 下一步可以探索的方向
 
@@ -712,7 +714,7 @@ python -m py_compile layers/linear.py engine/model_runner.py
 python tests/test_Day4.py
 ```
 
-> **💡 TP 与 Day1-6 代码的衔接说明：**
+> **TP 与 Day1-6 代码的衔接说明：**
 >
 > Day7 的 `layers/linear.py` 引入了 `ColumnParallelLinear` 和 `RowParallelLinear` 作为
 > `QKVLinear`/`MergedLinear`/`RowLinear` 的**替代**。两者的关系是：
@@ -724,6 +726,7 @@ python tests/test_Day4.py
 > 同理，`models/qwen3.py` 和 `engine/model_runner.py` 的 Day7 版本增加了 TP 支持，
 > 但单卡模式下行为不变。建议在 Day1-6 全部跑通后再应用 Day7 的改动。
 
+```bash
 # 阶段 2: 端到端推理（验证 graph 录制不干扰正常流程）
 # 如果显存不够录制 graph，可以先加 enforce_eager=True
 python -c "
@@ -748,4 +751,4 @@ print('单卡 eager 模式正常')
 
 ---
 
-**恭喜！你已完整掌握 nano-vLLM 的核心架构。** 🎉
+到这里，Day0-Day7 的主线走完了：一个能跑通 `example.py` 的引擎，加上 PagedAttention、Continuous Batching、Prefix Cache、CUDA Graph 和 TP（教学版）的完整认知。还没覆盖的是 §4.3 表里标「进阶」的那几项——Chunked Prefill、Radix Prefix Cache、投机解码、MoE、量化，从 Day8 起逐篇补齐。

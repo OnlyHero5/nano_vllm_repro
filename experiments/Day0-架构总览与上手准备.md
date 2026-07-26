@@ -1,8 +1,8 @@
-# Day 0 — 重温准备与架构总览
+# Day 0 — 架构总览与上手准备
 
 ## 本篇定位
 
-你已经三个月没碰这个项目了。本篇的任务是**帮你快速回忆起整个项目的骨架**，不写任何代码，纯复习。
+本篇不写一行代码，只做一件事：**把整个引擎的骨架和数据流铺开**，让你在动手改任何一层之前，先知道自己站在哪里。
 
 读完本篇后，你应该能：
 - 画出项目的数据流图
@@ -23,7 +23,7 @@
 
 ---
 
-## 2. 项目目录结构（回忆版）
+## 2. 项目目录结构
 
 ```
 nano_vll_repro/                  # 项目根目录
@@ -33,14 +33,14 @@ nano_vll_repro/                  # 项目根目录
 ├── llm.py                       # 对外接口（LLM 类，就是 LLMEngine 的别名）
 ├── example.py                   # 端到端推理示例脚本
 │
-├── engine/                      # 🧠 运行时核心 — 整个推理引擎的大脑
+├── engine/                      # 运行时核心 — 整个推理引擎的大脑
 │   ├── sequence.py              #   请求的运行时状态（token列表、状态机、block_table）
 │   ├── block_manager.py         #   KV Cache 物理块管理器 + Prefix Cache
 │   ├── scheduler.py             #   Continuous Batching 调度器（waiting/running 双队列）
 │   ├── model_runner.py          #   把一批 Sequence 整理成模型输入，执行推理
 │   └── llm_engine.py            #   顶层引擎循环（串联 Scheduler + ModelRunner）
 │
-├── layers/                      # 🏗️ 模型组件 — Transformer 的积木块
+├── layers/                      # 模型组件 — Transformer 的积木块
 │   ├── linear.py                #   融合 Linear（QKVLinear / MergedLinear / RowLinear）
 │   ├── layernorm.py             #   RMSNorm（含残差融合版本）
 │   ├── activation.py            #   SwiGLU 激活函数（SiLU × gate）
@@ -48,29 +48,37 @@ nano_vll_repro/                  # 项目根目录
 │   ├── attention.py             #   PagedAttention（Triton store kernel + FlashAttention）
 │   └── sampler.py               #   采样器（Greedy / Temperature / Gumbel-Max）
 │
-├── models/                      # 🎯 模型定义
+├── models/                      # 模型定义
 │   ├── qwen3.py                 #   Qwen3 模型（GQA + Q/K Norm + 融合权重映射）
 │   └── Qwen3-0.6B/              #   模型权重文件（需自行下载）
 │       ├── config.json
 │       ├── model.safetensors
 │       └── tokenizer.json
 │
-├── utils/                       # 🔧 工具
+├── utils/                       # 工具
 │   ├── context.py               #   全局 Context（在 ModelRunner 和 Attention 之间传元数据）
 │   └── loader.py                #   权重加载器（safetensors → 融合权重映射）
 │
-├── tests/                       # ✅ 测试
+├── tests/                       # 测试
 │   ├── test_Day1.py             #   基础数据结构测试
 │   ├── test_Day2.py             #   模型组件测试
 │   ├── test_Day3.py             #   PagedAttention 测试
 │   └── test_Day4.py             #   端到端测试
 │
-└── experiments/                 # 📖 本实验指南（你正在读的）
-    ├── Day0-重温准备与架构总览.md
+└── experiments/                 # 本实验指南（你正在读的）
+    ├── Day0-架构总览与上手准备.md
     ├── Day1-数据结构层.md
-    ├── ...
-    └── Day7-进阶优化.md
+    ├── ...（Day2-Day6：主线，逐层读透并改进）
+    ├── Day7-进阶优化与总结.md
+    ├── ...（Day8-Day13：进阶专题）
+    └── Day13-CPU-KV-Block-Offload.md
 ```
+
+> **两卷的读法不同**：
+>
+> - **Day0-Day6 是主线**：一层一层读透现有实现，找出它的薄弱处，动手补上。每篇改完都能用 `example.py` 和 `tests/test_Day1-4.py` 立刻验证。
+> - **Day7-Day13 是进阶专题**：CUDA Graph、Chunked Prefill、Radix Cache、投机解码、MoE、量化、Offload。这几篇给的是完整设计与代码，但需要你亲手落地到自己的仓库，再按各篇"验收命令"一节验证。其中 Day11A 的测试与 demo 在纯 CPU 上就能跑通（预期输出见该篇 §8/§9）。
+> - 进阶篇之间有依赖：Day7 依赖 Day4/5；Day8 依赖 Day4/5/6；Day10 依赖 Day4/8；Day11A 依赖 Day11。各篇开头有"前置依赖"框。
 
 ---
 
@@ -178,15 +186,7 @@ nano_vll_repro/                  # 项目根目录
 
 ### 4.1 PagedAttention（分页注意力）
 
-| 传统做法 | PagedAttention |
-|---------|---------------|
-| 每个请求分配一整块连续显存放 KV Cache | 把 KV Cache 切成固定大小的「页」(block = 256 tokens) |
-| 请求A: [████████░░░░░░░░] 预留太多浪费 | 请求A: [页0]→[页2]→[页5] 按需分配，可以不连续 |
-| 请求B: [████████████████] 放不下 | 请求B 可以复用请求A 的前几个页（Prefix Cache） |
-
-核心数据结构：
-- **block_table**（逻辑→物理映射）：`[17, 203, 41]` 表示逻辑块0→物理页17，逻辑块1→物理页203
-- **slot_mapping**（token→槽位）：`slot = 物理页号 × block_size + 页内偏移`
+传统做法给每个请求预留一整块连续显存放 KV Cache，会产生内部/外部碎片，且相同前缀无法共享。PagedAttention 把 KV Cache 切成固定大小的「页」（block = 256 tokens），按需分配、允许不连续，相同前缀的请求还能共享物理页（Prefix Cache）。每条序列用 `block_table` 记录逻辑块到物理页的映射，写 cache 时再换算成逐 token 的 `slot_mapping`。这里先记住这个大方向即可，碎片问题的具体形态和两个映射表的细节，Day3 会展开。
 
 ### 4.2 Continuous Batching（连续批处理）
 
@@ -219,45 +219,45 @@ nano-vLLM 用了一个更轻量的方案：
 
 ---
 
-## 5. 当前代码状态：哪些完成了，哪些还需要补
+## 5. 这一版实现的家底：哪些立住了，哪些还薄
 
-### ✅ 已经完成的（可正常运行）
+这套代码能跑通端到端推理，骨架是结实的。但"能跑"和"经得起推敲"之间还有距离——主线六篇要走的，就是这段距离。先看清家底：
 
-| 模块 | 文件 | 状态 |
+| 模块 | 文件 | 成色 |
 |------|------|------|
-| Config 配置 | `config.py` | ✅ 基础功能完整 |
-| SamplingParams | `sampling_params.py` | ⚠️ 只支持 temperature（缺 top_k/top_p） |
-| Sequence 状态机 | `engine/sequence.py` | ✅ 完整 |
-| Block + BlockManager | `engine/block_manager.py` | ✅ Prefix Cache 已实现 |
-| Scheduler | `engine/scheduler.py` | ✅ 双队列调度已实现 |
-| ModelRunner | `engine/model_runner.py` | ⚠️ 缺 `reset_context()` |
-| LLMEngine | `engine/llm_engine.py` | ⚠️ prefill token 统计不准确 |
-| RMSNorm | `layers/layernorm.py` | ✅ 含残差融合 |
-| SwiGLU 激活 | `layers/activation.py` | ✅ |
-| RoPE | `layers/rotary_embedding.py` | ✅ |
-| Attention + Triton kernel | `layers/attention.py` | ✅ |
-| 融合 Linear | `layers/linear.py` | ⚠️ weight_loader 有 dtype 问题 |
-| Sampler | `layers/sampler.py` | ⚠️ 只支持 temperature |
-| Qwen3 模型 | `models/qwen3.py` | ⚠️ forward 直接返回 logits |
-| 权重加载 | `utils/loader.py` | ✅ |
-| Context | `utils/context.py` | ✅ |
-| 对外接口 | `llm.py` | ✅ |
-| 推理脚本 | `example.py` | ✅ 可运行 |
+| Config 配置 | `config.py` | 结实，基础功能完整 |
+| SamplingParams | `sampling_params.py` | 还薄：只支持 temperature，缺 top_k/top_p |
+| Sequence 状态机 | `engine/sequence.py` | 结实 |
+| Block + BlockManager | `engine/block_manager.py` | 结实，Prefix Cache 已实现 |
+| Scheduler | `engine/scheduler.py` | 结实，双队列调度已实现 |
+| ModelRunner | `engine/model_runner.py` | 还薄：缺 `reset_context()` |
+| LLMEngine | `engine/llm_engine.py` | 还薄：prefill token 统计不准 |
+| RMSNorm | `layers/layernorm.py` | 结实，含残差融合 |
+| SwiGLU 激活 | `layers/activation.py` | 结实 |
+| RoPE | `layers/rotary_embedding.py` | 结实 |
+| Attention + Triton kernel | `layers/attention.py` | 结实 |
+| 融合 Linear | `layers/linear.py` | 还薄：weight_loader 的 dtype 对齐缺位 |
+| Sampler | `layers/sampler.py` | 还薄：只支持 temperature |
+| Qwen3 模型 | `models/qwen3.py` | 还薄：forward 直接返回 logits |
+| 权重加载 | `utils/loader.py` | 结实 |
+| Context | `utils/context.py` | 结实 |
+| 对外接口 | `llm.py` | 结实 |
+| 推理脚本 | `example.py` | 结实，可运行 |
 
-### ⚠️ 需要完善的地方（本指南 Day1-Day6 会修复）
+### 主线要补的八处（Day1-Day6 逐个动手）
 
-1. **Config 缺少 property**：下游代码散落着 `getattr(hf_config, ...)`，应该统一到 Config 的 property 里
-2. **SamplingParams 不支持 top_k/top_p**：只能控制 temperature
-3. **Linear 的 weight_loader 缺乏 dtype/device 对齐**：如果 safetensors 是 fp32、模型是 bf16，可能静默出错
-4. **Qwen3ForCausalLM.forward() 直接返回 logits**：不方便后续做 CUDA Graph
-5. **ModelRunner.run() 没有 reset_context()**：Context 可能在 step 之间泄漏
-6. **LLMEngine.step() 的 prefill token 统计**：把已缓存的 prefix token 也算进去了
-7. **`block_manager.py` 第 298 行 Off-by-One**：Prefix Cache 链式哈希条件 `len(block_table) > 2` 应为 `>= 2`（Day3 指南 §3 问题 4）
-8. **`context.py` 类型注解错误**：`max_context_len: int = None` 应为 `int | None = None`（Day1 指南 §3 问题 5）
-9. **`qwen3.py` 参数名笔误**：`from_pretrained(cls, mode_path)` 应为 `model_path`（Day4 指南 §3 问题 4）
-10. **`layernorm.py` docstring 拼写**：`redisual` → `residual`，`normalized_putput` → `normalized_output`（Day2 指南 §2）
+八处里没有一处是"随手改改"——每一处背后都有一个值得想清楚的设计问题，正文会连着问题一起讲：
 
-### 🔮 进阶扩展（Day7 会涉及）
+1. **Config 缺少 property**：下游代码散落着 `getattr(hf_config, ...)`，配置读取没有单一出口
+2. **SamplingParams 不支持 top_k/top_p**：采样策略被锁在 temperature 一个旋钮上
+3. **Linear 的 weight_loader 缺乏 dtype/device 对齐**：safetensors 是 fp32、模型是 bf16 时会静默出错
+4. **Qwen3ForCausalLM.forward() 直接返回 logits**：挡住了后面的 CUDA Graph 捕获
+5. **ModelRunner.run() 没有 reset_context()**：全局 Context 会在 step 之间泄漏
+6. **LLMEngine.step() 的 prefill token 统计**：把命中缓存的 prefix token 也算成了新算的
+7. **`block_manager.py` 的 Off-by-One**：Prefix Cache 链式哈希条件 `len(block_table) > 2` 应为 `>= 2`——一个字符的差别，让哈希链丢掉第一个 block（Day3 §3）
+8. **`context.py` 的类型注解**：`max_context_len: int = None` 应为 `int | None = None`（Day1 §3）
+
+### 进阶扩展（Day7 会涉及）
 
 - Tensor Parallel（多卡推理）
 - CUDA Graph（Decode 加速）
@@ -289,16 +289,16 @@ python tests/test_Day3.py
 python tests/test_Day4.py
 ```
 
-> **⚠️ 当前测试文件有已知 bug，直接运行会报错。** 各 bug 的修复方法详见对应 Day 指南的「验证步骤」：
+> **`tests/` 下的测试文件可以直接运行。** 这些测试有几个容易写错的地方，对应 Day 指南的「验证步骤」给出了错误写法与修正写法的对照讲解，建议配合阅读：
 >
-> | 测试文件 | 主要 bug | 修复说明位置 |
+> | 测试文件 | 易错点 | 对照讲解位置 |
 > |---------|---------|------------|
 > | `test_Day1.py` | `set_context()` 传参方式错误、`Config(model=...)` 参数名错误 | Day1 指南 §5 |
-> | `test_Day2.py` | `attn()` 多传了 `attention_mask=None` 参数 | Day2 指南 §5 |
+> | `test_Day2.py` | `attn()` 多传 `attention_mask=None`；`test_qwen3_model` 未设 Context 崩在 `None[layer_idx]` | Day2 指南 §5 |
 > | `test_Day3.py` | `set_context()` 传参方式错误、`store_kvcache()` 签名错误 | Day3 指南 §5 |
 > | `test_Day4.py` | 硬编码绝对路径 | Day4 指南 §5 |
 >
-> 建议：先跑 `example.py`（端到端推理），确认模型加载和基本推理正常后，再逐 Day 修复测试文件。
+> 建议：先跑 `example.py`（端到端推理），确认模型加载和基本推理正常后，再跑各 Day 测试。
 
 如果 `example.py` 能输出中文文本，说明环境 OK，可以继续 Day1。
 
@@ -309,11 +309,11 @@ python tests/test_Day4.py
 每天的内容结构：
 
 ```
-1. 📖 知识点讲解   ← 先理解「为什么」
-2. 🔍 已有代码回顾  ← 帮你回忆三个月前写了什么
-3. ⚠️  当前问题分析  ← 指出哪里需要改
-4. 📝 完整代码      ← 可以复制粘贴的完整文件
-5. ✅ 验证步骤      ← 确认改动正确
+1. 知识点讲解    ← 先想清「为什么这样设计」
+2. 这一层长什么样 ← 读透现有实现
+3. 这一版的薄弱处 ← 找出经不起推敲的地方
+4. 完整代码      ← 改进后的完整文件
+5. 验证步骤      ← 确认改动正确
 ```
 
 建议的阅读路径：
@@ -326,4 +326,4 @@ Day0（本篇）→ Day3（PagedAttention 核心，最重要）→ Day1 → Day2
 
 ---
 
-下一篇：**Day1 — 数据结构层**（Config / SamplingParams / Sequence / Context 的已有代码回顾与完善）
+下一篇：**Day1 — 数据结构层**（Config / SamplingParams / Sequence / Context，逐个读透与改进）
