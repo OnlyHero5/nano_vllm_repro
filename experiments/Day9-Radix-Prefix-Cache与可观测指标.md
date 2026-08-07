@@ -1,5 +1,7 @@
 # Day 9 — Radix Prefix Cache：让前缀复用看得见
 
+> **前置依赖**：本篇只修改 `engine/block_manager.py`，以基线代码（或主线 Day1-Day6 落地后的代码）为基础，不依赖其他进阶篇。若已落地 Day8（Chunked Prefill），本篇的 `allocate()` 替换版与其调度器兼容（命中时仍推进 `num_cached_tokens`）。
+
 当前 `BlockManager` 的 prefix cache 已经能工作：完整块算 hash，hash 命中就复用物理块。但它有两个短板。
 
 第一，**复用路径不透明。** 命中了多少次？复用了多少 token？哪些块是共享的？一问三不知。代码看起来支持 prefix cache，实际可能从来没命中过——没有指标，你根本没法判断。
@@ -195,6 +197,13 @@ def _lookup_prefix_block(
         self.prefix_cache_stats.miss_count += 1
         return -1, current_hash
 
+    # 关键校验：节点是注册时的快照，但物理块可能已被释放、回收、覆写。
+    # 必须对照块的实时内容，否则会把别的序列的 KV 当成自己的前缀复用。
+    block = self.blocks[node.block_id]
+    if block.hash != current_hash or block.token_ids != token_ids:
+        self.prefix_cache_stats.miss_count += 1
+        return -1, current_hash
+
     self.prefix_cache_stats.hit_count += 1
     self.prefix_cache_stats.reused_blocks += 1
     self.prefix_cache_stats.reused_tokens += len(token_ids)
@@ -250,6 +259,8 @@ def allocate(self, seq: Sequence):
         seq.block_table.append(fresh_block.block_id)
 ```
 
+> **与基线的行为差异**：基线 `allocate()` 有一个 `cache_miss` 标志——一旦某个块 miss，后续块就不再计算哈希（`block_manager.py:199,207,232`）。本篇去掉了这个短路：miss 之后的完整块也会继续注册。因为哈希链在 `prefix_hash` 上，后续块的哈希由前一块的哈希唯一确定，注册它们不会造成假命中，反而让 prefix tree 更完整、共享更充分。
+
 ### 4.6 替换 `append_slot()`
 
 decode 或 chunked prefill 可能让末尾块在某一刻刚好填满。`append_slot()` 在“当前块刚好填满”时也要把它挂进 prefix tree：
@@ -280,6 +291,8 @@ def append_slot(self, seq: Sequence):
         current_hash = self.compute_hash(token_ids, prefix_hash)
         self._register_prefix_block(last_block.block_id, token_ids, current_hash, prefix_hash)
 ```
+
+> **注意**：这里用的是 `len(block_table) > 1`，而基线代码（`block_manager.py:298`）写的是 `> 2`。基线是个 off-by-one：当 `block_table` 恰好有 2 个块时，第二块填满后算哈希应该链上第一块的哈希（`block_table[-2]`），但 `> 2` 为 False 导致 `prefix_hash = -1`，哈希链断裂。`> 1` 才是正确的。本篇替换 `append_slot()` 时一并修正了这个问题。
 
 ### 4.7 新增观测接口
 
@@ -438,6 +451,8 @@ PY
 3. **最后一个不完整块也注册进 prefix cache。** 不稳定尾块会被错误复用。
 4. **只做复用，不做观测指标。** 你根本不知道 prefix cache 到底有没有起作用。
 5. **把 prefix tree 节点塞进 `Sequence` 里长期保存。** 没必要让序列持有这么重的状态；统计和复用逻辑都放 `BlockManager`。
+6. **prompt 长度恰为 block_size 整数倍时首次 decode 崩溃。** `allocate()` 对完整块已注册 hash（`hash != -1`），但 `append_slot()` 情况 2 断言 `last_block.hash == -1`。当 prompt 刚好 256 个 token 时，第一次 decode 进入情况 2 会触发 `AssertionError`。这是基线既有的 bug（`block_manager.py:295`），本篇原样保留。bs=256 下触发概率很低，但值得知道。修法：情况 2 改为 `if last_block.hash != -1: return`（已注册则跳过）。
+7. **本篇测试只覆盖 `allocate()` 路径。** §6 的四个测试均只调用 `allocate()`，§4.6 新写的 `append_slot()` 树登记逻辑没有测试锁定。落地后建议补一个 decode 填满块后检查 `hash_to_node` 的用例。
 
 ---
 

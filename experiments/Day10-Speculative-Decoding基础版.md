@@ -75,6 +75,8 @@ speculative decoding 打破这个默认：
 - **target model**：当前仓库已有的主模型，结果以它为准。
 - **draft model**：更小、更便宜，只负责提议 token。
 
+> **隐含约束**：draft和 target 必须共享同一个 tokenizer（词表）。accept/reject 逐 token 比较的是 token ID，词表不同则比较无意义。本篇端到端验证用同一个模型同时充当 draft 和 target，天然满足；换真实小模型做 draft 时，确认它和 target 用同一份 tokenizer。
+
 ---
 
 ## 4. 修改 `config.py`
@@ -102,6 +104,8 @@ if self.enable_speculative_decoding:
 ## 5. 修改 `engine/model_runner.py`：不写 cache 的验证前向
 
 新增三个方法到 `ModelRunner`。核心是 `forward_logits_no_cache()`：对一段完整上下文做一次 prefill 式前向，但 Context 里 `kv_cache=None`、`slot_mapping=None`——`Attention.forward()` 会因此跳过 `store_kvcache`，走普通 varlen 路径。**不需要给临时序列分配 block，也就不存在 block 泄漏。**
+
+> **import 提示**：下面的代码用到了 `reset_context()`，但基线 `model_runner.py:28` 只导入了 `Context, set_context, get_context`。在文件顶部的 import 行补上 `reset_context`：`from utils.context import Context, set_context, get_context, reset_context`。
 
 ```python
 @torch.inference_mode()

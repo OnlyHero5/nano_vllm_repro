@@ -1,5 +1,7 @@
 # Day 11 — MoE：把 FFN 路径变成可选的专家混合
 
+> **前置依赖**：本篇修改 `config.py`、`models/qwen3.py`、`utils/loader.py`，以主线 Day1-Day6 落地后的代码为基础。不依赖其他进阶篇。Day11A（Expert Offloading）依赖本篇。
+
 Qwen3-0.6B 是 dense 模型：每个 token 过同一个 FFN。MoE 模型不一样——每个 token 由 router 挑出 top-k 个 expert，只过这几个 expert 的 FFN，再按 routing weight 加权合并。参数量可以大很多，但每个 token 的实际计算量反而更小。
 
 这次把一条教学版 MoE FFN 路径接进 Qwen3 主线：

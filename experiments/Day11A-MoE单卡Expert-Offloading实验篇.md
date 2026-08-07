@@ -1,6 +1,6 @@
 # Day 11A — Expert Offloading：8GB 卡怎么跑 32 个 expert
 
-> **前置依赖**：本篇代码 import 的 `MoEExpert / MoERouter / Qwen3MoEMLP` 来自 **Day11** §4.2-4.4（需要你先把它们写进 `models/qwen3.py`，仓库基线里没有）。详细自检见 §3。本篇自带的测试与 demo 在 CPU 和 CUDA 上都能跑通（§8/§9 给出了实际运行输出）。
+> **前置依赖**：本篇代码 import 的 `MoEExpert / MoERouter / Qwen3MoEMLP` 来自 **Day11** §4.2-4.4（需要你先把它们写进 `models/qwen3.py`，仓库基线里没有）。详细自检见 §3。本篇自带的测试与 demo 在 CPU 和 CUDA 上都能跑通（§8/§9 给出了实际运行输出）。注意："CPU 可跑"指计算路径不依赖 CUDA，但 import 链仍经过 `models/qwen3.py` → `layers/attention.py` → `import flash_attn`，所以环境里需要装好 flash-attn（即使不在 GPU 上跑）。
 
 Day11 的 `Qwen3MoEMLP` 把所有 expert 权重都放在 GPU 上。8 个 expert 还好，32 个就炸了——MoE 的显存压力主要出在 expert 权重上，不是 attention 或 KV cache。
 
@@ -18,7 +18,7 @@ Day11 的 `Qwen3MoEMLP` 把所有 expert 权重都放在 GPU 上。8 个 expert 
 ## 1. 做完之后你应该能
 
 1. 解释 MoE 推理的显存压力为什么主要出在 expert 权重上，并算出 8 GB 卡能塞下多大的 MoE。
-2. 实现一个 CPU master + GPU slot pool + LRU 的 `ExpertWeightCache`，并证明它的输出和"全 expert 都在 GPU"的参考实现 bit-for-bit 等价。
+2. 实现一个 CPU master + GPU slot pool + LRU 的 `ExpertWeightCache`，并证明它的输出和"全 expert 都在 GPU"的参考实现数值等价（CPU 上逐位精确；CUDA 上因 `index_add_` 浮点非确定性，误差在 1e-5 量级以内）。
 3. 实现"基于 routing 频次的热门 expert 钉死"，并量化命中率提升。
 4. 知道为什么这条玩具路径可以推广到真实 Qwen1.5-MoE / DeepSeek-V2-Lite，但当前仓库没必要直接接上去。
 

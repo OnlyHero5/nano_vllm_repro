@@ -3,6 +3,8 @@
 > **本篇边界**：这里落地的是 KV block 的 GPU↔CPU 换入换出（swap）——不是权重 offload，不涉及跨后端（JAX / MLX / C++）实现，也不含生产级 KV connector / LMCache / 异步 prefetch。一条 swap 通路讲透，比铺开三条讲不透更有用。
 >
 > **前置依赖**：本篇修改 `engine/sequence.py / engine/block_manager.py / engine/model_runner.py / engine/scheduler.py`，以主线 Day1-Day6 落地后的代码为基础。
+>
+> **与 Day12 的关系**：本篇 §5.2整体重写 `ModelRunner.allocate_kv_cache()`（硬编码 fp16 裸 tensor）。如果你已经落地了 Day12（KV Cache 量化），Day12 版本的 `allocate_kv_cache()` 会被本篇覆盖。两篇是**并列实验**，不是递进关系——先做哪篇就保留哪篇的 `allocate_kv_cache()`，另一篇的该节跳过。
 
 当前主线在 GPU KV block 不够时，做法很粗暴：把 sequence preempt 回 `WAITING`，释放 KV cache，下一轮重新 prefill。已经算过的 KV 全扔了，重来一遍。
 
@@ -791,19 +793,26 @@ def schedule(self) -> Tuple[List[Sequence], bool]:
         seq = self.running.popleft()
 
         while not self.block_manager.can_append(seq):
+            # 优先尝试 swap out 其他序列（仅 offload 启用时有效）
             victim = self.block_manager.select_swap_out_victim(self.running)
             if victim is not None:
                 self.swap_out_sequence(victim)
                 continue
 
+            # 尝试 swap out 当前序列（仅 offload 启用时有效）
             if self.block_manager.can_swap_out(seq):
                 self.swap_out_sequence(seq)
                 seq = None
                 break
 
-            self.__preempt(seq)
-            seq = None
-            break
+            # offload 未启用或无法 swap：回退到基线 LRU 抢占
+            if self.running:
+                lru_victim = self.running.pop()
+                self.__preempt(lru_victim)
+            else:
+                self.__preempt(seq)
+                seq = None
+                break
 
         if seq is None:
             continue

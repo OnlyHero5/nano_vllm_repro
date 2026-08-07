@@ -496,6 +496,8 @@ def get_kv_cache_for_attention(
     return k_cache, v_cache
 ```
 
+> **显存代价提示**：量化分支的 `get_kv_cache_for_attention` 在每个 decode step 为每层分配一份完整的 fp16 反量化副本（上面两行 `.float() * scales` 产生新 tensor）。峰值显存近似翻倍——量化省下的 cache 显存会被 decode 时的临时副本吃掉。教学版不优化这一点（生产实现会在 FlashAttention kernel 内部做 on-the-fly 反量化），但长上下文下可能 OOM，需要知道。
+
 ### 4.1 两种模拟方案的含义
 
 - `int8_sim`：标准对称 int8 量化模拟，按 block + KV head 维护 scale。
@@ -1008,4 +1010,4 @@ python -m py_compile config.py utils/kvcache_quant.py engine/model_runner.py uti
 4. `Context.kv_cache` 为什么需要表达 `torch.Tensor | KVCacheView`。
 5. `layers/attention.py` 为什么是“写前量化、读前反量化”，而不是直接声明支持生产级 FP8 FlashAttention。
 
-下一篇：`Day13-CPU-KV-Block-Offload.md`（内容是 CPU KV block swap）。
+下一篇：`Day13-CPU-KV-Block-Offload.md`（内容是 CPU KV block swap）。注意：Day13 与本篇是**并列实验**，两篇都整体重写 `ModelRunner.allocate_kv_cache()`。如果你先落地了本篇，再做 Day13 时其 §5.2 会覆盖本篇的量化分配逻辑——跳过 Day13 §5.2 即可保留本篇版本。

@@ -123,6 +123,8 @@ self.head_dim = getattr(self.model.config, "head_dim", ...)
 
 这是 **走后门**——明明有 Config 对象，却绕过它直接访问 HF config。应该把翻译逻辑收到 Config 的 property 里。
 
+> **顺带一提**：`Config.kvcache_block_size`（config.py:35）在 `__post_init__` 里校验了必须是 256 的倍数（:47），但运行时没有任何消费者——`ModelRunner` 和 `LLMEngine` 用的都是 `Sequence.block_size` 类属性（sequence.py:68，硬编码 256）。改 Config 的这个字段不会改变任何行为。这也是"配置没有单一出口"的一个表现：真正生效的 block_size 散落在 Sequence 的类属性里，Config 里那份只是个摆设。
+
 ### 问题 2：SamplingParams 不能设置 temperature=0
 
 当前校验是：
